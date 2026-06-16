@@ -36,6 +36,27 @@ fn bind_address() -> String {
     format!("0.0.0.0:{port}")
 }
 
+/// Hosts allowed in the `Host` header by rmcp's DNS-rebinding protection.
+/// Defaults to loopback (good for local dev); when served behind a public URL
+/// (tunnel/PaaS), the `PUBLIC_URL` host must be allowed or every `/mcp` request
+/// is rejected before the bearer token is even checked.
+fn allowed_hosts() -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(url) = std::env::var("PUBLIC_URL") {
+        if let Some(host) = url.split("://").nth(1).and_then(|r| r.split('/').next()) {
+            let host = host.trim();
+            if !host.is_empty() {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+    hosts
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetCandidArgs {
     /// Canister principal, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai" (the ICP ledger).
@@ -367,7 +388,9 @@ async fn main() -> anyhow::Result<()> {
         StreamableHttpService::new(
             move || Ok(IcTools::new(agent.clone(), proposals.clone())),
             LocalSessionManager::default().into(),
-            StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(ct.child_token())
+                .with_allowed_hosts(allowed_hosts()),
         )
     };
 
