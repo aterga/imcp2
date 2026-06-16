@@ -36,24 +36,10 @@
 </div>
 
 <div class="card">
-  <strong>Signed canister call</strong>
-  <p class="muted" style="margin:.3rem 0 .6rem">
-    Calls the ICP ledger <code>icrc1_balance_of</code> for your principal. The
-    request is signed by your II identity (not anonymous).
-  </p>
-  <label for="canister">Ledger canister</label>
-  <input id="canister" value="ryjl3-tyaaa-aaaaa-aaaba-cai" />
-  <div class="row" style="margin-top:.6rem">
-    <button id="call" disabled>Check my balance (signed)</button>
-  </div>
-  <pre id="out">(sign in first)</pre>
-</div>
-
-<div class="card">
   <strong>Pending proposals from the LLM</strong>
   <p class="muted" style="margin:.3rem 0 .6rem">
-    Transfers the LLM proposed via the MCP <code>propose_transfer</code> tool.
-    Review the amount and destination — what you see here is exactly what your
+    Calls the LLM proposed via the MCP <code>propose_call</code> tool. Review the
+    canister, method and arguments — what you see here is exactly what your
     Internet Identity signs. The server never holds your key.
   </p>
   <div id="proposals"><span class="muted">(sign in to load)</span></div>
@@ -66,7 +52,7 @@
 
 <script type="module">
 import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
-import { HttpAgent, Actor, polling } from "https://esm.sh/@dfinity/agent@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
+import { HttpAgent, polling } from "https://esm.sh/@dfinity/agent@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
 import { Principal } from "https://esm.sh/@dfinity/principal@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
 // Rust `candid` compiled to WASM: the browser encodes/decodes Candid locally,
 // so the user signs exactly the bytes encoded from the text they reviewed.
@@ -88,17 +74,6 @@ const II_URL = "https://id.ai";
 const IC_HOST = "https://icp-api.io";
 
 const $ = (id) => document.getElementById(id);
-
-// Minimal IDL for the demo balance query in the card above.
-const ledgerIdl = ({ IDL }) => {
-  const Account = IDL.Record({
-    owner: IDL.Principal,
-    subaccount: IDL.Opt(IDL.Vec(IDL.Nat8)),
-  });
-  return IDL.Service({
-    icrc1_balance_of: IDL.Func([Account], [IDL.Nat], ["query"]),
-  });
-};
 
 async function loadProposals() {
   const box = $("proposals");
@@ -189,8 +164,6 @@ async function render() {
   $("principal").textContent = authed ? principal.toText() : "—";
   $("login").disabled = authed;
   $("logout").disabled = !authed;
-  $("call").disabled = !authed;
-  if (!authed) $("out").textContent = "(sign in first)";
   if (authed) {
     loadProposals();
     if (!window.__proposalTimer) {
@@ -216,29 +189,6 @@ $("login").onclick = async () => {
 $("logout").onclick = async () => {
   await authClient.logout();
   await render();
-};
-
-$("call").onclick = async () => {
-  $("out").textContent = "signing & calling…";
-  try {
-    const identity = authClient.getIdentity();
-    const agent = await HttpAgent.create({ identity, host: IC_HOST });
-    const ledger = Actor.createActor(ledgerIdl, {
-      agent,
-      canisterId: $("canister").value.trim(),
-    });
-    const balance = await ledger.icrc1_balance_of({
-      owner: identity.getPrincipal(),
-      subaccount: [],
-    });
-    $("out").textContent =
-      `principal: ${identity.getPrincipal().toText()}\n` +
-      `icrc1_balance_of -> ${balance.toString()} e8s ` +
-      `(${Number(balance) / 1e8} ICP)\n\n` +
-      `This call was signed by your II identity.`;
-  } catch (e) {
-    $("out").textContent = "error: " + (e?.message ?? e);
-  }
 };
 
 await render();
