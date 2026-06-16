@@ -27,9 +27,14 @@ use rmcp::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const BIND_ADDRESS: &str = "0.0.0.0:8000";
 /// Public IC API boundary node. Anonymous queries/updates go here.
 const IC_URL: &str = "https://icp-api.io";
+
+/// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
+fn bind_address() -> String {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
+    format!("0.0.0.0:{port}")
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetCandidArgs {
@@ -416,8 +421,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(oauth)
         .merge(protected_mcp);
 
-    let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    tracing::info!("listening on http://{BIND_ADDRESS}  (MCP at /mcp, OAuth at /oauth/*)");
+    let bind = bind_address();
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("listening on http://{bind}  (MCP at /mcp, OAuth at /oauth/*)");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
