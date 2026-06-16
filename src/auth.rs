@@ -23,7 +23,7 @@ use axum::{
     Form,
 };
 use base64::Engine;
-use rmcp::transport::auth::{ClientRegistrationResponse, OAuthClientConfig};
+use rmcp::transport::auth::OAuthClientConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -265,13 +265,15 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     );
     tracing::info!(principal = %grant.principal, "issued MCP access token");
 
-    Json(json!({
+    let mut body = json!({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": TOKEN_TTL.as_secs(),
-        "scope": grant.scope,
-    }))
-    .into_response()
+    });
+    if let Some(scope) = grant.scope {
+        body["scope"] = json!(scope);
+    }
+    Json(body).into_response()
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -297,8 +299,19 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
     let client = OAuthClientConfig::new(client_id.clone(), req.redirect_uris[0].clone());
     store.clients.write().await.insert(client_id.clone(), client);
 
-    let mut resp = ClientRegistrationResponse::new(client_id, req.redirect_uris);
-    resp.client_name = req.client_name;
+    // Public client (PKCE, no secret): build the response by hand and OMIT
+    // client_secret entirely. Returning client_secret: null breaks clients that
+    // validate it as a string; absence correctly signals a public client.
+    let mut resp = json!({
+        "client_id": client_id,
+        "redirect_uris": req.redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    });
+    if let Some(name) = req.client_name {
+        resp["client_name"] = json!(name);
+    }
     (StatusCode::CREATED, Json(resp)).into_response()
 }
 
