@@ -164,13 +164,10 @@ impl IcTools {
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
 
-        // Binary reply -> textual Candid (Candid messages are self-describing).
-        match IDLArgs::from_bytes(&reply_bytes) {
-            Ok(decoded) => Ok(ok(decoded.to_string())),
-            Err(e) => Ok(err(format!(
-                "call succeeded but reply could not be decoded as Candid: {e}"
-            ))),
-        }
+        // Decode the reply using the canister's Candid interface so record/variant
+        // field names are recovered (the wire format only carries field-name
+        // hashes; type-less decoding would show e.g. `25_979` instead of `name`).
+        Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
     }
 
     #[tool(
@@ -234,6 +231,49 @@ impl IcTools {
             None => Ok(err(format!("no proposal with id {proposal_id}"))),
         }
     }
+}
+
+impl IcTools {
+    /// Decode a reply to textual Candid, preferring the canister's Candid
+    /// interface so field names are recovered; fall back to type-less decoding.
+    async fn decode_reply(&self, canister: Principal, method: &str, bytes: &[u8]) -> String {
+        if let Some(text) = self.decode_with_interface(canister, method, bytes).await {
+            return text;
+        }
+        match IDLArgs::from_bytes(bytes) {
+            Ok(decoded) => decoded.to_string(),
+            Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
+        }
+    }
+
+    /// Type-aware decode: fetch `candid:service`, look up the method's return
+    /// types, and decode against them. None if the canister exposes no interface
+    /// or anything fails (caller falls back to type-less decoding).
+    async fn decode_with_interface(
+        &self,
+        canister: Principal,
+        method: &str,
+        bytes: &[u8],
+    ) -> Option<String> {
+        let raw = self
+            .agent
+            .read_state_canister_metadata(canister, "candid:service")
+            .await
+            .ok()?;
+        let did = String::from_utf8(raw).ok()?;
+        decode_bytes_with_did(&did, method, bytes)
+    }
+}
+
+/// Decode Candid `bytes` against the return types of `method` declared in the
+/// `.did` text, recovering record/variant field names. None if the interface
+/// can't be parsed, the method isn't found, or decoding fails.
+fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String> {
+    let (env, actor) = candid_parser::utils::CandidSource::Text(did).load().ok()?;
+    let actor = actor?;
+    let func = env.get_method(&actor, method).ok()?;
+    let decoded = IDLArgs::from_bytes_with_types(bytes, &env, &func.rets).ok()?;
+    Some(decoded.to_string())
 }
 
 /// The verified II principal of the calling MCP session, if the request carried
@@ -367,4 +407,32 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_bytes_with_did;
+    use candid::types::value::IDLArgs;
+    use candid_parser::parse_idl_args;
+
+    // Field names are hashed on the Candid wire; decoding against the method's
+    // declared return type must recover them (type-less decoding shows hashes).
+    #[test]
+    fn typed_decode_recovers_field_names() {
+        let did = "service : { stats : () -> (record { name : text; url : text }) query }";
+        // Encode a record reply (names get hashed in the wire format).
+        let bytes = parse_idl_args("(record { name = \"ICP\"; url = \"https://internetcomputer.org\" })")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+
+        // Type-less decode -> hashed field ids.
+        let typeless = IDLArgs::from_bytes(&bytes).unwrap().to_string();
+        assert!(!typeless.contains("name ="), "type-less should NOT have names: {typeless}");
+
+        // Typed decode against the .did -> real field names.
+        let typed = decode_bytes_with_did(did, "stats", &bytes).expect("typed decode");
+        assert!(typed.contains("name ="), "typed should have `name`: {typed}");
+        assert!(typed.contains("url ="), "typed should have `url`: {typed}");
+    }
 }
