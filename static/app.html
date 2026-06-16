@@ -65,9 +65,9 @@
 </p>
 
 <script type="module">
-import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2";
-import { HttpAgent, Actor, polling } from "https://esm.sh/@dfinity/agent@2";
-import { Principal } from "https://esm.sh/@dfinity/principal@2";
+import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
+import { HttpAgent, Actor, polling } from "https://esm.sh/@dfinity/agent@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
+import { Principal } from "https://esm.sh/@dfinity/principal@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
 // Rust `candid` compiled to WASM: the browser encodes/decodes Candid locally,
 // so the user signs exactly the bytes encoded from the text they reviewed.
 import initCandid, { encode_args, decode_args } from "/wasm/candid_wasm.js";
