@@ -23,7 +23,7 @@ use axum::{
     Form,
 };
 use base64::Engine;
-use rmcp::transport::auth::{AuthorizationMetadata, ClientRegistrationResponse, OAuthClientConfig};
+use rmcp::transport::auth::{ClientRegistrationResponse, OAuthClientConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -305,19 +305,24 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
 // ---- Discovery metadata -------------------------------------------------
 
 /// GET /.well-known/oauth-authorization-server
+///
+/// Built by hand rather than via `AuthorizationMetadata` so that absent optional
+/// fields are *omitted* — clients (e.g. Claude Code) validate this document and
+/// reject `null` where they expect an array (`scopes_supported` is optional per
+/// RFC 8414, so leaving it out is correct).
 pub async fn authorization_server_metadata() -> Response {
     let base = base_url();
-    let mut metadata = AuthorizationMetadata::default();
-    metadata.authorization_endpoint = format!("{base}/oauth/authorize");
-    metadata.token_endpoint = format!("{base}/oauth/token");
-    metadata.registration_endpoint = Some(format!("{base}/oauth/register"));
-    metadata.issuer = Some(base.clone());
-    metadata.response_types_supported = Some(vec!["code".into()]);
-    metadata.code_challenge_methods_supported = Some(vec!["S256".into()]);
-    metadata
-        .additional_fields
-        .insert("grant_types_supported".into(), json!(["authorization_code"]));
-    Json(metadata).into_response()
+    Json(json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{base}/oauth/authorize"),
+        "token_endpoint": format!("{base}/oauth/token"),
+        "registration_endpoint": format!("{base}/oauth/register"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }))
+    .into_response()
 }
 
 /// GET /.well-known/oauth-protected-resource
