@@ -20,11 +20,43 @@ encoding/decoding (and, later, signing) against the IC via
 happens: the user reviews and signs it on `/app` with their Internet Identity
 (see below). `propose_call` / `check_proposal` require a bearer token.
 
+## Connect from an MCP client
+
+Add the server to Claude Code (replace the URL with wherever it's hosted):
+
+```bash
+claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
+```
+
+Then run `/mcp` → **ic-poc** → authenticate: a browser opens the authorize page,
+you sign in with **Internet Identity (id.ai)**, and the four tools become
+available. (Any MCP client with remote HTTP + OAuth support works.)
+
 ## Run
 
 ```bash
 cargo run
 # serves http://0.0.0.0:8000  (MCP streamable-HTTP at /mcp, info page at /)
+# honours $PORT (default 8000) and $PUBLIC_URL (default http://localhost:8000)
+```
+
+## Deploy
+
+The server is a single binary plus the `static/` assets (the WASM Candid codec
+is prebuilt and committed). Two requirements when hosting:
+
+- **HTTPS** — the id.ai passkey (WebAuthn) only works in a secure context.
+- **`PUBLIC_URL`** — set it to the public https URL; it's used in the OAuth
+  discovery documents, the `/app` link, and the allowed-Host list.
+
+A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
+zero-signup public URL during testing, expose the local server with a tunnel:
+
+```bash
+cargo run &                                   # local server on :8000
+cloudflared tunnel --url http://localhost:8000   # prints https://<name>.trycloudflare.com
+# restart the server with PUBLIC_URL set to that URL:
+PUBLIC_URL=https://<name>.trycloudflare.com cargo run
 ```
 
 ## Try it (raw MCP over curl)
