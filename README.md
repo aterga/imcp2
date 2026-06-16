@@ -61,6 +61,22 @@ Endpoints:
 Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
 pointing at the resource metadata, as the MCP spec expects.
 
+**The principal is verified, not asserted.** After id.ai login the browser signs
+a server-issued nonce (`GET /oauth/nonce`) with its delegation identity and
+sends the delegation chain. The server (`src/delegation.rs`) verifies:
+
+1. the chain links the session key to the II root (the II canister signature is
+   checked against the IC mainnet root key via `ic-signature-verification`);
+2. the leaf session key's signature over the nonce (Ed25519 or P-256);
+3. the principal is `self_authenticating(root_pubkey)`;
+4. no delegation has expired.
+
+Only then is a principal-bound code minted. This matters because the server
+keys per-principal session data off that identity — a spoofable principal would
+let one user read another's session. (Fund safety is independent: that's
+enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
+codes live 120s, nonces 300s, access tokens 1h.
+
 Set the public base URL (used in discovery docs) with `PUBLIC_URL`
 (default `http://localhost:8000`).
 
@@ -72,9 +88,9 @@ Set the public base URL (used in discovery docs) with `PUBLIC_URL`
       token bound to the II principal.
 - [x] Frontend page (`/app`) where the same II identity **signs** canister
       calls client-side; the server never holds the key.
-- [ ] Verify a signed II **delegation** at `/oauth/approve` instead of trusting
-      the browser-asserted principal (see `auth.rs` TODO).
-- [ ] Enforce PKCE; expire tokens/sessions.
+- [x] Verify a signed II **delegation** server-side so the principal is real,
+      not browser-asserted (`src/delegation.rs`, unit-tested).
+- [x] Enforce PKCE (S256); expire codes / nonces / tokens.
 - [ ] Have the LLM propose a candidate canister call that the user reviews &
       signs on `/app` (what-you-see-is-what-you-sign), with the server relaying
       the signed ingress envelope.

@@ -8,6 +8,7 @@
 //! Calls are anonymous for now (query methods + read-only). Signing comes later.
 
 mod auth;
+mod delegation;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
@@ -227,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::get(auth::protected_resource_metadata),
         )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
+        .route("/oauth/nonce", axum::routing::get(auth::nonce))
         .route("/oauth/approve", axum::routing::post(auth::approve))
         .route("/oauth/token", axum::routing::post(auth::token))
         .route("/oauth/register", axum::routing::post(auth::register))

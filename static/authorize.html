@@ -43,29 +43,49 @@ $("login").onclick = async () => {
       $("login").disabled = false;
       $("status").textContent = "login error: " + e;
     },
-    onSuccess: () => {
-      const principal = authClient.getIdentity().getPrincipal().toText();
-      $("status").textContent = "signed in as " + principal + " — redirecting…";
-      // Hand the principal + OAuth params back to the server, which mints the
-      // authorization code and redirects to the client's redirect_uri.
-      const form = document.createElement("form");
-      form.method = "POST";
-      form.action = "/oauth/approve";
-      const add = (k, v) => {
-        const i = document.createElement("input");
-        i.type = "hidden"; i.name = k; i.value = v ?? "";
-        form.appendChild(i);
-      };
-      add("client_id", params.get("client_id"));
-      add("redirect_uri", params.get("redirect_uri"));
-      add("scope", params.get("scope") ?? "");
-      add("state", params.get("state") ?? "");
-      add("principal", principal);
-      document.body.appendChild(form);
-      form.submit();
-    },
+    onSuccess: proveAndRedirect,
   });
 };
+
+// Prove control of the principal: fetch a server nonce, sign it with the
+// delegation identity, and POST the nonce signature + delegation chain. The
+// server verifies the chain before issuing a principal-bound auth code.
+async function proveAndRedirect() {
+  const identity = authClient.getIdentity();
+  const principal = identity.getPrincipal().toText();
+  $("status").textContent = "signed in as " + principal + " — proving identity…";
+  try {
+    const { nonce } = await (await fetch("/oauth/nonce")).json();
+    const sig = await identity.sign(new TextEncoder().encode(nonce));
+    const chain = identity.getDelegation().toJSON(); // { publicKey, delegations: [...] }
+
+    const resp = await fetch("/oauth/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: params.get("client_id"),
+        redirect_uri: params.get("redirect_uri"),
+        scope: params.get("scope") ?? "",
+        state: params.get("state") ?? "",
+        code_challenge: params.get("code_challenge"),
+        nonce,
+        pubkey: chain.publicKey,
+        delegations: chain.delegations,
+        signature: toHex(sig),
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error_description ?? data.error ?? "approve failed");
+    window.location = data.redirect;
+  } catch (e) {
+    $("login").disabled = false;
+    $("status").textContent = "error: " + (e?.message ?? e);
+  }
+}
+
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 </script>
 </body>
 </html>
