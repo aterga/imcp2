@@ -451,7 +451,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>get_candid</code>, <code>call_canister</code> (textual Candid in/out).</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (anonymous), <code>propose_call</code> / <code>check_proposal</code> (sign via Internet Identity). All speak textual Candid.</p>
 <p><a href="/app">Signing frontend</a> — sign in with Internet Identity (id.ai) and sign canister calls.</p>
 </body></html>"#;
 
