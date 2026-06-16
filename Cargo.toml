@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "tools/icp-mcp-server",
+]
+resolver = "2"
