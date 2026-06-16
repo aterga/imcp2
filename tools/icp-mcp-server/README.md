@@ -25,8 +25,8 @@ cargo run -p icp-mcp-server
 The image runs the server over stdio (its entrypoint is the binary).
 
 ```sh
-# Build (context must be the repo root so the workspace resolves).
-docker build -f tools/icp-mcp-server/Dockerfile -t ghcr.io/<owner>/icp-mcp-server:latest .
+# Build from the repo root (the Dockerfile lives there).
+docker build -t ghcr.io/<owner>/icp-mcp-server:latest .
 
 # Push to a registry your deployment target can pull from.
 docker push ghcr.io/<owner>/icp-mcp-server:latest
