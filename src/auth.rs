@@ -332,16 +332,30 @@ pub async fn protected_resource_metadata() -> Response {
 
 // ---- Bearer-token gate for /mcp -----------------------------------------
 
-pub async fn require_token(State(store): State<AuthStore>, request: Request<Body>, next: Next) -> Response {
+/// The verified principal of the authenticated MCP session, injected into request
+/// extensions so tools can attribute actions to it.
+#[derive(Clone, Debug)]
+pub struct AuthedPrincipal(pub String);
+
+pub async fn require_token(State(store): State<AuthStore>, mut request: Request<Body>, next: Next) -> Response {
     let token = request
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::to_owned);
 
-    match token {
-        Some(t) if store.principal_for_token(t).await.is_some() => next.run(request).await,
-        _ => {
+    let principal = match token {
+        Some(t) => store.principal_for_token(&t).await,
+        None => None,
+    };
+
+    match principal {
+        Some(p) => {
+            request.extensions_mut().insert(AuthedPrincipal(p));
+            next.run(request).await
+        }
+        None => {
             let challenge = format!(
                 "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
                 base_url()

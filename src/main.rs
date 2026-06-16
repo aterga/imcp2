@@ -9,18 +9,21 @@
 
 mod auth;
 mod delegation;
+mod proposals;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
+use proposals::Proposals;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::{
         streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
         StreamableHttpServerConfig,
     },
-    schemars, ErrorData as McpError, ServerHandler,
+    schemars, ErrorData as McpError, RoleServer, ServerHandler,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -52,17 +55,39 @@ fn default_args() -> String {
     "()".to_string()
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ProposeCallArgs {
+    /// Target canister principal.
+    canister_id: String,
+    /// Method name to invoke.
+    method: String,
+    /// Arguments in textual Candid syntax (same format as `call_canister`).
+    #[serde(default = "default_args")]
+    args: String,
+    /// If true the user will perform a read-only `query`; otherwise an `update`.
+    #[serde(default)]
+    is_query: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CheckProposalArgs {
+    /// The proposal id returned by `propose_call`.
+    proposal_id: String,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
+    proposals: Proposals,
     tool_router: ToolRouter<IcTools>,
 }
 
 #[tool_router]
 impl IcTools {
-    fn new(agent: Agent) -> Self {
+    fn new(agent: Agent, proposals: Proposals) -> Self {
         Self {
             agent,
+            proposals,
             tool_router: Self::tool_router(),
         }
     }
@@ -147,6 +172,77 @@ impl IcTools {
             ))),
         }
     }
+
+    #[tool(
+        description = "Propose ANY canister call (any canister, any method, textual Candid args — same as call_canister) for the user to review and SIGN with their Internet Identity. This does NOT execute the call; it queues a candidate the user must approve and sign on the signing page. The server does not sign. Returns a proposal id and review URL; poll `check_proposal` for the outcome."
+    )]
+    async fn propose_call(
+        &self,
+        Parameters(ProposeCallArgs {
+            canister_id,
+            method,
+            args,
+            is_query,
+        }): Parameters<ProposeCallArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = Principal::from_text(&canister_id) {
+            return Ok(err(format!("invalid canister id: {e}")));
+        }
+        // Validate the textual Candid parses, so malformed args fail at proposal
+        // time. The actual encoding happens in the browser (what-you-see-is-
+        // what-you-sign) — the server never produces the bytes that get signed.
+        if let Err(e) = candid_parser::parse_idl_args(&args) {
+            return Ok(err(format!("could not parse args `{args}`: {e}")));
+        }
+
+        let proposer = authed_principal(&ctx).unwrap_or_else(|| "unknown".to_string());
+        let p = self
+            .proposals
+            .create_call(canister_id, method, args, is_query, proposer)
+            .await;
+
+        let url = format!("{}/app", auth::base_url());
+        Ok(ok(format!(
+            "Proposed call (NOT executed — awaiting the user's signature).\n\
+             proposal_id: {}\n\
+             {} {} {}\n\
+             The user must review and sign this at: {}\n\
+             Then call check_proposal with the id to see the result.",
+            p.id,
+            if p.is_query { "query" } else { "update" },
+            p.method,
+            p.args,
+            url
+        )))
+    }
+
+    #[tool(description = "Check the status/result of a call proposal created with propose_call. Result is returned as textual Candid once the user has signed.")]
+    async fn check_proposal(
+        &self,
+        Parameters(CheckProposalArgs { proposal_id }): Parameters<CheckProposalArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.proposals.get(&proposal_id).await {
+            Some(p) => Ok(ok(format!(
+                "status: {}\ncall: {} {} {}\nresult: {}",
+                p.status,
+                if p.is_query { "query" } else { "update" },
+                p.method,
+                p.args,
+                p.result.unwrap_or_else(|| "(none yet)".into())
+            ))),
+            None => Ok(err(format!("no proposal with id {proposal_id}"))),
+        }
+    }
+}
+
+/// The verified II principal of the calling MCP session, if the request carried
+/// a valid bearer token (injected by [`auth::require_token`]).
+fn authed_principal(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<auth::AuthedPrincipal>())
+        .map(|p| p.0.clone())
 }
 
 #[tool_handler]
@@ -158,7 +254,10 @@ impl ServerHandler for IcTools {
         .with_server_info(Implementation::from_build_env())
         .with_instructions(
             "Internet Computer tools. `get_candid` fetches a canister's Candid interface; \
-             `call_canister` calls a method with textual Candid in and out."
+             `call_canister` calls a method anonymously with textual Candid in and out; \
+             `propose_call` queues ANY canister call for the user to review and sign with \
+             their Internet Identity (the server never signs); `check_proposal` reports the \
+             signed call's outcome as textual Candid."
                 .to_string(),
         )
     }
@@ -196,14 +295,29 @@ async fn main() -> anyhow::Result<()> {
     let agent = Agent::builder().with_url(IC_URL).build()?;
     tracing::info!("built ic-agent against {IC_URL}");
 
+    let proposals = Proposals::default();
+
     let ct = tokio_util::sync::CancellationToken::new();
-    let mcp = StreamableHttpService::new(
-        move || Ok(IcTools::new(agent.clone())),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
-    );
+    let mcp = {
+        let agent = agent.clone();
+        let proposals = proposals.clone();
+        StreamableHttpService::new(
+            move || Ok(IcTools::new(agent.clone(), proposals.clone())),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        )
+    };
 
     let store = auth::AuthStore::new();
+
+    // Browser-facing proposal API used by /app (signer reviews & reports outcome).
+    let api = axum::Router::new()
+        .route("/api/proposals", axum::routing::get(proposals::list_pending))
+        .route(
+            "/api/proposals/{id}/result",
+            axum::routing::post(proposals::submit_result),
+        )
+        .with_state(proposals.clone());
 
     // /mcp is gated by a bearer token issued after Internet Identity login.
     let protected_mcp = axum::Router::new()
@@ -238,6 +352,9 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
         .route("/app", axum::routing::get(|| async { axum::response::Html(APP_HTML) }))
+        // Browser-side Candid codec (Rust compiled to WASM) served for /app.
+        .nest_service("/wasm", tower_http::services::ServeDir::new("static/wasm"))
+        .merge(api)
         .merge(oauth)
         .merge(protected_mcp);
 

@@ -49,22 +49,36 @@
   <pre id="out">(sign in first)</pre>
 </div>
 
+<div class="card">
+  <strong>Pending proposals from the LLM</strong>
+  <p class="muted" style="margin:.3rem 0 .6rem">
+    Transfers the LLM proposed via the MCP <code>propose_transfer</code> tool.
+    Review the amount and destination — what you see here is exactly what your
+    Internet Identity signs. The server never holds your key.
+  </p>
+  <div id="proposals"><span class="muted">(sign in to load)</span></div>
+</div>
+
 <p class="muted" style="font-size:.85rem">
-  Next: wrap this II login in an OpenID authorize endpoint so the MCP client
-  obtains a token, and build candidate canister calls proposed by the LLM that
-  you approve &amp; sign here.
+  The LLM proposes; you review &amp; sign here with II; the call goes straight to
+  the IC. The untrusted MCP server is never in the signing path.
 </p>
 
 <script type="module">
 import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2";
-import { HttpAgent, Actor } from "https://esm.sh/@dfinity/agent@2";
+import { HttpAgent, Actor, polling } from "https://esm.sh/@dfinity/agent@2";
+import { Principal } from "https://esm.sh/@dfinity/principal@2";
+// Rust `candid` compiled to WASM: the browser encodes/decodes Candid locally,
+// so the user signs exactly the bytes encoded from the text they reviewed.
+import initCandid, { encode_args, decode_args } from "/wasm/candid_wasm.js";
+await initCandid();
 
 const II_URL = "https://id.ai";
 const IC_HOST = "https://icp-api.io";
 
 const $ = (id) => document.getElementById(id);
 
-// Minimal IDL for the one method we demonstrate.
+// Minimal IDL for the demo balance query in the card above.
 const ledgerIdl = ({ IDL }) => {
   const Account = IDL.Record({
     owner: IDL.Principal,
@@ -74,6 +88,86 @@ const ledgerIdl = ({ IDL }) => {
     icrc1_balance_of: IDL.Func([Account], [IDL.Nat], ["query"]),
   });
 };
+
+async function loadProposals() {
+  const box = $("proposals");
+  let list;
+  try {
+    list = await (await fetch("/api/proposals")).json();
+  } catch {
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = '<span class="muted">no pending proposals</span>';
+    return;
+  }
+  box.innerHTML = "";
+  for (const p of list) {
+    const div = document.createElement("div");
+    div.className = "card";
+    div.style.margin = ".5rem 0";
+    div.innerHTML =
+      `<div><strong>${p.is_query ? "query" : "update"} · ${p.method}</strong></div>` +
+      `<div>on <code>${p.canister_id}</code></div>` +
+      `<div>args: <code>${p.args}</code></div>` +
+      `<div class="muted">proposed by ${p.proposer} · encoded locally in your browser before signing</div>`;
+    const btn = document.createElement("button");
+    btn.textContent = "Review & sign with II";
+    btn.style.marginTop = ".5rem";
+    const out = document.createElement("pre");
+    out.style.display = "none";
+    btn.onclick = () => signProposal(p, btn, out);
+    div.appendChild(btn);
+    div.appendChild(out);
+    box.appendChild(div);
+  }
+}
+
+// Encode the proposed call's textual Candid LOCALLY (WASM), sign & submit with
+// the II identity, then decode the reply LOCALLY. The server is not in the
+// encode/decode/sign path; it only records the textual outcome.
+async function signProposal(p, btn, out) {
+  btn.disabled = true;
+  out.style.display = "block";
+  out.textContent = "encoding locally, signing & submitting to the IC…";
+  let ok = false;
+  let detail = "";
+  try {
+    const arg = encode_args(p.args); // Uint8Array, from the text shown above
+    const identity = authClient.getIdentity();
+    const agent = await HttpAgent.create({ identity, host: IC_HOST });
+    const canisterId = Principal.fromText(p.canister_id);
+
+    let replyBytes;
+    if (p.is_query) {
+      const res = await agent.query(canisterId, { methodName: p.method, arg });
+      if (res.status !== "replied") {
+        throw new Error("query rejected: " + (res.reject_message ?? JSON.stringify(res)));
+      }
+      replyBytes = new Uint8Array(res.reply.arg);
+    } else {
+      const submit = await agent.call(canisterId, {
+        methodName: p.method,
+        arg,
+        effectiveCanisterId: canisterId,
+      });
+      const strategy = (polling.defaultStrategy ?? polling.strategy?.defaultStrategy)();
+      const polled = await polling.pollForResponse(agent, canisterId, submit.requestId, strategy);
+      replyBytes = new Uint8Array(polled?.reply ?? polled); // v2: {reply}, older: buffer
+    }
+    detail = decode_args(replyBytes); // textual Candid, decoded locally
+    ok = true;
+  } catch (e) {
+    detail = "error: " + (e?.message ?? e);
+  }
+  out.textContent = detail;
+  await fetch(`/api/proposals/${p.id}/result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ok, detail }),
+  }).catch(() => {});
+  setTimeout(loadProposals, 500);
+}
 
 let authClient = await AuthClient.create();
 
@@ -86,6 +180,16 @@ async function render() {
   $("logout").disabled = !authed;
   $("call").disabled = !authed;
   if (!authed) $("out").textContent = "(sign in first)";
+  if (authed) {
+    loadProposals();
+    if (!window.__proposalTimer) {
+      window.__proposalTimer = setInterval(loadProposals, 4000);
+    }
+  } else {
+    clearInterval(window.__proposalTimer);
+    window.__proposalTimer = null;
+    $("proposals").innerHTML = '<span class="muted">(sign in to load)</span>';
+  }
 }
 
 $("login").onclick = async () => {

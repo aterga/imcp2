@@ -12,10 +12,13 @@ encoding/decoding (and, later, signing) against the IC via
 | Tool | Args | Returns |
 |------|------|---------|
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query` | Reply as textual Candid |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query` | Reply as textual Candid (anonymous call) |
+| `propose_call` | `canister_id`, `method`, `args` (textual Candid), `is_query` | A proposal id + `/app` URL for the user to review & **sign** |
+| `check_proposal` | `proposal_id` | Status + the signed call's reply as textual Candid |
 
-Calls are currently **anonymous** — query methods and read-only update calls.
-Authenticated/signed calls are the next milestone.
+`call_canister` runs **anonymously**. `propose_call` is how a signed call
+happens: the user reviews and signs it on `/app` with their Internet Identity
+(see below). `propose_call` / `check_proposal` require a bearer token.
 
 ## Run
 
@@ -91,6 +94,34 @@ Set the public base URL (used in discovery docs) with `PUBLIC_URL`
 - [x] Verify a signed II **delegation** server-side so the principal is real,
       not browser-asserted (`src/delegation.rs`, unit-tested).
 - [x] Enforce PKCE (S256); expire codes / nonces / tokens.
-- [ ] Have the LLM propose a candidate canister call that the user reviews &
-      signs on `/app` (what-you-see-is-what-you-sign), with the server relaying
-      the signed ingress envelope.
+- [x] LLM proposes ANY canister call (`propose_call`); the user reviews &
+      **signs it on `/app`** with their II identity. The browser encodes the
+      textual Candid locally via Rust-compiled-to-WASM (`candid-wasm/`) and
+      decodes the reply locally — what-you-see-is-what-you-sign, with the
+      untrusted server never in the encode/decode/sign path.
+
+## Propose → sign → execute loop
+
+`propose_call(canister_id, method, args, is_query)` (authenticated MCP tool)
+queues a candidate call bound to the verified principal and returns a proposal
+id + the `/app` URL. It does **not** execute anything. On `/app`, after II
+login, pending proposals are listed; the user reviews the textual Candid and
+clicks sign — the browser:
+
+1. encodes the displayed textual Candid args to bytes locally (WASM);
+2. signs & submits the call to the IC with the II identity (`agent.query` /
+   `agent.call`);
+3. decodes the reply locally (WASM) and posts the textual outcome back.
+
+The LLM reads the result with `check_proposal(proposal_id)`. The server only
+brokers the proposal text and records the outcome — it holds no key and never
+produces the bytes that get signed.
+
+### Building the WASM codec
+
+```bash
+wasm-pack build candid-wasm --target web --release -d ../static/wasm
+```
+
+(The built artifacts are committed under `static/wasm/` so the server runs
+out of the box.)

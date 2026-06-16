@@ -23,7 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 ic-signature-verification = "0.3.0"
 sha2 = "0.11.0"
 base64 = "0.22.1"
