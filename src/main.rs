@@ -30,6 +30,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Public IC API boundary node. Anonymous queries/updates go here.
 const IC_URL: &str = "https://icp-api.io";
 
+/// Candid references exposed as MCP resources so the client writes correct
+/// textual Candid. The textual-syntax cheat sheet is emphasised because every
+/// tool here speaks textual Candid; the full type reference backs it up.
+const CANDID_TEXTUAL_URI: &str = "candid://textual-syntax";
+const CANDID_REFERENCE_URI: &str = "candid://reference";
+const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
+const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
+
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
 fn bind_address() -> String {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
@@ -333,17 +341,58 @@ fn authed_principal(ctx: &RequestContext<RoleServer>) -> Option<String> {
 impl ServerHandler for IcTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
-            ServerCapabilities::builder().enable_tools().build(),
+            ServerCapabilities::builder().enable_tools().enable_resources().build(),
         )
         .with_server_info(Implementation::from_build_env())
         .with_instructions(
-            "Internet Computer tools. `get_candid` fetches a canister's Candid interface; \
-             `call_canister` calls a method anonymously with textual Candid in and out; \
-             `propose_call` queues ANY canister call for the user to review and sign with \
-             their Internet Identity (the server never signs); `check_proposal` reports the \
-             signed call's outcome as textual Candid."
+            "Internet Computer tools. Every tool speaks TEXTUAL Candid — the `(...)` value \
+             syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
+             the binary form. Before writing Candid args, consult the `candid://textual-syntax` \
+             resource (the value syntax these tools use); `candid://reference` has the full type \
+             reference. `get_candid` fetches a canister's Candid interface; `call_canister` calls \
+             a method anonymously with textual Candid in and out; `propose_call` queues ANY \
+             canister call for the user to review and sign with their Internet Identity (the \
+             server never signs); `check_proposal` reports the signed call's outcome."
                 .to_string(),
         )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult {
+            resources: vec![
+                RawResource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)")
+                    .no_annotation(),
+                RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
+                    .no_annotation(),
+            ],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let body = match request.uri.as_str() {
+            CANDID_TEXTUAL_URI => CANDID_TEXTUAL_MD,
+            CANDID_REFERENCE_URI => CANDID_REFERENCE_MD,
+            other => {
+                return Err(McpError::resource_not_found(
+                    "resource_not_found",
+                    Some(serde_json::json!({ "uri": other })),
+                ))
+            }
+        };
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            body,
+            request.uri,
+        )]))
     }
 }
 
