@@ -1,0 +1,23 @@
+[package]
+name = "mcp-poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmcp = { version = "1.7", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+ic-agent = "0.47"
+candid = { version = "0.10", features = ["value"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+axum = "0.8"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-util = "0.7"
+candid_parser = "0.3.2"
