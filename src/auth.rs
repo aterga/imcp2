@@ -71,12 +71,24 @@ impl AuthStore {
         Self::default()
     }
 
+    /// Accept a client for the OAuth flow, lazily recording it if unseen.
+    ///
+    /// PoC stance: client registration is ceremonial here — the real auth is the
+    /// verified II delegation plus PKCE, not the client's identity. Accepting
+    /// any client_id (rather than requiring it to be pre-registered) keeps the
+    /// flow working across server restarts, where Claude Code reuses a cached
+    /// dynamically-registered client_id against the in-memory store. The
+    /// redirect_uri is still restricted to loopback to avoid an open redirector.
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
+        if !is_loopback_redirect(redirect_uri) {
+            return false;
+        }
         self.clients
-            .read()
+            .write()
             .await
-            .get(client_id)
-            .is_some_and(|c| c.redirect_uri.contains(redirect_uri))
+            .entry(client_id.to_string())
+            .or_insert_with(|| OAuthClientConfig::new(client_id.to_string(), redirect_uri.to_string()));
+        true
     }
 
     /// The verified principal behind a bearer token, if valid and unexpired.
@@ -274,6 +286,14 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
         body["scope"] = json!(scope);
     }
     Json(body).into_response()
+}
+
+/// Loopback redirect targets only — accept any port (OAuth clients like Claude
+/// Code pick an ephemeral localhost callback port), reject non-local hosts.
+fn is_loopback_redirect(redirect_uri: &str) -> bool {
+    redirect_uri.starts_with("http://localhost")
+        || redirect_uri.starts_with("http://127.0.0.1")
+        || redirect_uri.starts_with("http://[::1]")
 }
 
 fn pkce_s256(verifier: &str) -> String {
