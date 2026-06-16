@@ -42,12 +42,39 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 # => ("Internet Computer")
 ```
 
+## Auth (OAuth 2.1, login via Internet Identity)
+
+`/mcp` is gated by a bearer token. The MCP client obtains it with a standard
+OAuth 2.1 authorization-code flow — except the authorize page logs the user in
+with **Internet Identity (id.ai)** via `@dfinity/auth-client` instead of
+username/password, and the issued token is bound to the resulting **principal**.
+
+Endpoints:
+
+- `GET /.well-known/oauth-authorization-server` — AS metadata
+- `GET /.well-known/oauth-protected-resource` — points clients at the AS
+- `POST /oauth/register` — dynamic client registration
+- `GET  /oauth/authorize` — serves the id.ai login page
+- `POST /oauth/approve` — called after II login; mints a principal-bound code
+- `POST /oauth/token` — exchanges the code for an access token
+
+Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
+pointing at the resource metadata, as the MCP spec expects.
+
+Set the public base URL (used in discovery docs) with `PUBLIC_URL`
+(default `http://localhost:8000`).
+
 ## Roadmap
 
 - [x] Two Candid tools over MCP streamable-HTTP, anonymous calls.
-- [ ] OpenID auth between MCP client and server; login page authenticates via
-      `@dfinity/auth-client` against **id.ai** (Internet Identity) instead of
-      username/password.
-- [ ] Frontend page served by this server where the same II identity **signs**
-      canister calls (what-you-see-is-what-you-sign), so the untrusted server
-      only relays signed ingress envelopes.
+- [x] OpenID/OAuth auth between MCP client and server; authorize page logs in
+      via `@dfinity/auth-client` against **id.ai** instead of username/password,
+      token bound to the II principal.
+- [x] Frontend page (`/app`) where the same II identity **signs** canister
+      calls client-side; the server never holds the key.
+- [ ] Verify a signed II **delegation** at `/oauth/approve` instead of trusting
+      the browser-asserted principal (see `auth.rs` TODO).
+- [ ] Enforce PKCE; expire tokens/sessions.
+- [ ] Have the LLM propose a candidate canister call that the user reviews &
+      signs on `/app` (what-you-see-is-what-you-sign), with the server relaying
+      the signed ingress envelope.

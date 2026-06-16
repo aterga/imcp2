@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Authorize MCP client — Internet Identity</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; text-align: center; }
+  button { font: inherit; padding: .6rem 1.1rem; border-radius: .4rem; border: 1px solid #888; background: #f4f4f5; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  code { background: #f4f4f5; padding: 0 .2rem; border-radius: .2rem; word-break: break-all; }
+  .muted { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Authorize access</h1>
+<p class="muted">
+  Client <code id="client"></code> is requesting access to the MCP server.
+  Sign in with Internet Identity to approve — your principal becomes the
+  authenticated subject of the access token.
+</p>
+
+<p><button id="login">Sign in with Internet Identity</button></p>
+<p id="status" class="muted"></p>
+
+<script type="module">
+import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2";
+
+const II_URL = "https://id.ai";
+const params = new URLSearchParams(location.search);
+const $ = (id) => document.getElementById(id);
+$("client").textContent = params.get("client_id") ?? "(unknown)";
+
+const authClient = await AuthClient.create();
+
+$("login").onclick = async () => {
+  $("login").disabled = true;
+  $("status").textContent = "opening Internet Identity…";
+  await authClient.login({
+    identityProvider: II_URL,
+    maxTimeToLive: BigInt(8) * BigInt(3_600_000_000_000),
+    onError: (e) => {
+      $("login").disabled = false;
+      $("status").textContent = "login error: " + e;
+    },
+    onSuccess: () => {
+      const principal = authClient.getIdentity().getPrincipal().toText();
+      $("status").textContent = "signed in as " + principal + " — redirecting…";
+      // Hand the principal + OAuth params back to the server, which mints the
+      // authorization code and redirects to the client's redirect_uri.
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = "/oauth/approve";
+      const add = (k, v) => {
+        const i = document.createElement("input");
+        i.type = "hidden"; i.name = k; i.value = v ?? "";
+        form.appendChild(i);
+      };
+      add("client_id", params.get("client_id"));
+      add("redirect_uri", params.get("redirect_uri"));
+      add("scope", params.get("scope") ?? "");
+      add("state", params.get("state") ?? "");
+      add("principal", principal);
+      document.body.appendChild(form);
+      form.submit();
+    },
+  });
+};
+</script>
+</body>
+</html>

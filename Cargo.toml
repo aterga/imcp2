@@ -8,9 +8,11 @@ rmcp = { version = "1.7", features = [
     "server",
     "macros",
     "transport-streamable-http-server",
+    "auth",
 ] }
 ic-agent = "0.47"
 candid = { version = "0.10", features = ["value"] }
+candid_parser = "0.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"
 anyhow = "1"
@@ -20,4 +22,5 @@ schemars = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7"
-candid_parser = "0.3.2"
+uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.7", features = ["cors"] }

@@ -7,6 +7,8 @@
 //! The LLM only ever deals with textual Candid; encoding/decoding happens here.
 //! Calls are anonymous for now (query methods + read-only). Signing comes later.
 
+mod auth;
+
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
 use rmcp::{
@@ -200,13 +202,45 @@ async fn main() -> anyhow::Result<()> {
         StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
     );
 
+    let store = auth::AuthStore::new();
+
+    // /mcp is gated by a bearer token issued after Internet Identity login.
+    let protected_mcp = axum::Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(axum::middleware::from_fn_with_state(
+            store.clone(),
+            auth::require_token,
+        ));
+
+    // OAuth authorization-server + discovery endpoints (CORS-open for clients).
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+    let oauth = axum::Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(auth::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            axum::routing::get(auth::protected_resource_metadata),
+        )
+        .route("/oauth/authorize", axum::routing::get(auth::authorize))
+        .route("/oauth/approve", axum::routing::post(auth::approve))
+        .route("/oauth/token", axum::routing::post(auth::token))
+        .route("/oauth/register", axum::routing::post(auth::register))
+        .layer(cors)
+        .with_state(store.clone());
+
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
         .route("/app", axum::routing::get(|| async { axum::response::Html(APP_HTML) }))
-        .nest_service("/mcp", mcp);
+        .merge(oauth)
+        .merge(protected_mcp);
 
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    tracing::info!("listening on http://{BIND_ADDRESS}  (MCP at /mcp)");
+    tracing::info!("listening on http://{BIND_ADDRESS}  (MCP at /mcp, OAuth at /oauth/*)");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
