@@ -24,12 +24,26 @@ cargo run -p icp-mcp-server
 
 The image runs the server over stdio (its entrypoint is the binary).
 
-```sh
-# Build (context must be the repo root so the workspace resolves).
-docker build -f tools/icp-mcp-server/Dockerfile -t ghcr.io/<owner>/icp-mcp-server:latest .
+### CI builds (recommended)
 
-# Push to a registry your deployment target can pull from.
-docker push ghcr.io/<owner>/icp-mcp-server:latest
+The [`Build and push image`](../../.github/workflows/docker.yml) workflow builds a
+`linux/amd64` image and pushes it to GitHub Container Registry on every push.
+After a run on the default branch you get:
+
+```
+ghcr.io/<owner>/icp-mcp-server:latest
+```
+
+GHCR packages are **private** by default. To let mcplambda.io pull it, either make
+the package public (GitHub → repo → Packages → the package → *Package settings* →
+*Change visibility*), or give mcplambda.io registry pull credentials.
+
+### Local build (optional)
+
+```sh
+# Build from the repo root (the Dockerfile lives there).
+docker build -t icp-mcp-server .
+docker run -i --rm icp-mcp-server   # -i is required for the stdio transport
 ```
 
 ## Deploy to mcplambda.io
