@@ -1,0 +1,16 @@
+[package]
+name = "icp-mcp-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
+ic-agent = "0.47"
+candid = { version = "0.10", features = ["value"] }
+candid_parser = "0.1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
