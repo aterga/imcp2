@@ -70,8 +70,19 @@ import { HttpAgent, Actor, polling } from "https://esm.sh/@dfinity/agent@2.4.1?d
 import { Principal } from "https://esm.sh/@dfinity/principal@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
 // Rust `candid` compiled to WASM: the browser encodes/decodes Candid locally,
 // so the user signs exactly the bytes encoded from the text they reviewed.
-import initCandid, { encode_args, decode_args } from "/wasm/candid_wasm.js";
+import initCandid, { encode_args, decode_args, encode_args_with_did, decode_rets_with_did } from "/wasm/candid_wasm.js";
 await initCandid();
+
+// Encode args / decode the reply with the canister's interface when available
+// (recovers field names); fall back to type-less if the .did is missing or fails.
+function encodeArgs(p) {
+  if (p.did) { try { return encode_args_with_did(p.did, p.method, p.args); } catch (e) { /* fall through */ } }
+  return encode_args(p.args);
+}
+function decodeReply(p, bytes) {
+  if (p.did) { try { return decode_rets_with_did(p.did, p.method, bytes); } catch (e) { /* fall through */ } }
+  return decode_args(bytes);
+}
 
 const II_URL = "https://id.ai";
 const IC_HOST = "https://icp-api.io";
@@ -133,7 +144,7 @@ async function signProposal(p, btn, out) {
   let ok = false;
   let detail = "";
   try {
-    const arg = encode_args(p.args); // Uint8Array, from the text shown above
+    const arg = encodeArgs(p); // encoded locally from the text shown above
     const identity = authClient.getIdentity();
     const agent = await HttpAgent.create({ identity, host: IC_HOST });
     const canisterId = Principal.fromText(p.canister_id);
@@ -155,7 +166,7 @@ async function signProposal(p, btn, out) {
       const polled = await polling.pollForResponse(agent, canisterId, submit.requestId, strategy);
       replyBytes = new Uint8Array(polled?.reply ?? polled); // v2: {reply}, older: buffer
     }
-    detail = decode_args(replyBytes); // textual Candid, decoded locally
+    detail = decodeReply(p, replyBytes); // textual Candid, decoded locally with types
     ok = true;
   } catch (e) {
     detail = "error: " + (e?.message ?? e);

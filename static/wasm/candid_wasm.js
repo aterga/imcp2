@@ -1,7 +1,9 @@
 /* @ts-self-types="./candid_wasm.d.ts" */
 
 /**
- * Decode Candid reply bytes to textual Candid (Candid messages are self-describing).
+ * Decode Candid reply bytes to textual Candid, type-less (field names appear as
+ * their wire-format hashes). Prefer `decode_rets_with_did` when an interface is
+ * available.
  * @param {Uint8Array} bytes
  * @returns {string}
  */
@@ -27,6 +29,39 @@ export function decode_args(bytes) {
 }
 
 /**
+ * Decode reply bytes against a method's declared return types (from the `.did`),
+ * recovering record/variant field names instead of hashes.
+ * @param {string} did
+ * @param {string} method
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+export function decode_rets_with_did(did, method, bytes) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.decode_rets_with_did(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
  * Encode textual Candid arguments (e.g. `(record { amount = 5 })`) to bytes.
  * @param {string} text
  * @returns {Uint8Array}
@@ -41,6 +76,30 @@ export function encode_args(text) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * Encode textual Candid args against a method's declared argument types (from
+ * the canister's `.did`), coercing literals to the right Candid types.
+ * @param {string} did
+ * @param {string} method
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+export function encode_args_with_did(did, method, text) {
+    const ptr0 = passStringToWasm0(did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encode_args_with_did(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
 }
 function __wbg_get_imports() {
     const import0 = {

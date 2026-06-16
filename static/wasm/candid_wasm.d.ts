@@ -2,21 +2,37 @@
 /* eslint-disable */
 
 /**
- * Decode Candid reply bytes to textual Candid (Candid messages are self-describing).
+ * Decode Candid reply bytes to textual Candid, type-less (field names appear as
+ * their wire-format hashes). Prefer `decode_rets_with_did` when an interface is
+ * available.
  */
 export function decode_args(bytes: Uint8Array): string;
+
+/**
+ * Decode reply bytes against a method's declared return types (from the `.did`),
+ * recovering record/variant field names instead of hashes.
+ */
+export function decode_rets_with_did(did: string, method: string, bytes: Uint8Array): string;
 
 /**
  * Encode textual Candid arguments (e.g. `(record { amount = 5 })`) to bytes.
  */
 export function encode_args(text: string): Uint8Array;
 
+/**
+ * Encode textual Candid args against a method's declared argument types (from
+ * the canister's `.did`), coercing literals to the right Candid types.
+ */
+export function encode_args_with_did(did: string, method: string, text: string): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly decode_args: (a: number, b: number) => [number, number, number, number];
+    readonly decode_rets_with_did: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly encode_args: (a: number, b: number) => [number, number, number, number];
+    readonly encode_args_with_did: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __externref_table_dealloc: (a: number) => void;

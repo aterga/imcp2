@@ -183,9 +183,10 @@ impl IcTools {
         }): Parameters<ProposeCallArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = Principal::from_text(&canister_id) {
-            return Ok(err(format!("invalid canister id: {e}")));
-        }
+        let principal = match Principal::from_text(&canister_id) {
+            Ok(p) => p,
+            Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        };
         // Validate the textual Candid parses, so malformed args fail at proposal
         // time. The actual encoding happens in the browser (what-you-see-is-
         // what-you-sign) — the server never produces the bytes that get signed.
@@ -193,10 +194,19 @@ impl IcTools {
             return Ok(err(format!("could not parse args `{args}`: {e}")));
         }
 
+        // Best-effort fetch of the canister's interface so the browser can
+        // encode/decode this call with field names (recovering hashed fields).
+        let did = self
+            .agent
+            .read_state_canister_metadata(principal, "candid:service")
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+
         let proposer = authed_principal(&ctx).unwrap_or_else(|| "unknown".to_string());
         let p = self
             .proposals
-            .create_call(canister_id, method, args, is_query, proposer)
+            .create_call(canister_id, method, args, is_query, proposer, did)
             .await;
 
         let url = format!("{}/app", auth::base_url());
@@ -204,8 +214,10 @@ impl IcTools {
             "Proposed call (NOT executed — awaiting the user's signature).\n\
              proposal_id: {}\n\
              {} {} {}\n\
-             The user must review and sign this at: {}\n\
-             Then call check_proposal with the id to see the result.",
+             Ask the user to review and sign it at: {}\n\
+             Then call check_proposal with this proposal_id — it will WAIT for the \
+             signature and return the result. If it comes back still pending, call \
+             check_proposal again.",
             p.id,
             if p.is_query { "query" } else { "update" },
             p.method,
@@ -214,12 +226,18 @@ impl IcTools {
         )))
     }
 
-    #[tool(description = "Check the status/result of a call proposal created with propose_call. Result is returned as textual Candid once the user has signed.")]
+    #[tool(
+        description = "Check a proposal created with propose_call. Waits up to ~25s for the user to sign and returns the result (textual Candid) as soon as it's available; if it returns while still pending, call it again."
+    )]
     async fn check_proposal(
         &self,
         Parameters(CheckProposalArgs { proposal_id }): Parameters<CheckProposalArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.proposals.get(&proposal_id).await {
+        let waited = self
+            .proposals
+            .wait_for_result(&proposal_id, std::time::Duration::from_secs(25))
+            .await;
+        match waited {
             Some(p) => Ok(ok(format!(
                 "status: {}\ncall: {} {} {}\nresult: {}",
                 p.status,

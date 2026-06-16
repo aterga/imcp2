@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -33,6 +34,9 @@ pub struct Proposal {
     pub args: String,
     pub is_query: bool,
     pub proposer: String,
+    /// The canister's Candid interface, if available, so the browser can encode
+    /// args and decode the reply *with types* (recovering field names).
+    pub did: Option<String>,
     /// "pending" | "done" | "failed"
     pub status: String,
     pub result: Option<String>,
@@ -43,6 +47,7 @@ pub struct Proposal {
 pub struct Proposals(Arc<RwLock<HashMap<String, Proposal>>>);
 
 impl Proposals {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_call(
         &self,
         canister_id: String,
@@ -50,6 +55,7 @@ impl Proposals {
         args: String,
         is_query: bool,
         proposer: String,
+        did: Option<String>,
     ) -> Proposal {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
         let proposal = Proposal {
@@ -59,6 +65,7 @@ impl Proposals {
             args,
             is_query,
             proposer,
+            did,
             status: "pending".to_string(),
             result: None,
             created_ns: now,
@@ -69,6 +76,21 @@ impl Proposals {
 
     pub async fn get(&self, id: &str) -> Option<Proposal> {
         self.0.read().await.get(id).cloned()
+    }
+
+    /// Wait (bounded) for a proposal to leave the `pending` state — so the LLM
+    /// can call `check_proposal` once after the user signs and get the result,
+    /// rather than polling in a loop. Returns the latest state on timeout.
+    pub async fn wait_for_result(&self, id: &str, timeout: Duration) -> Option<Proposal> {
+        let deadline = timeout.as_millis() / 500;
+        for _ in 0..deadline.max(1) {
+            let p = self.get(id).await?;
+            if p.status != "pending" {
+                return Some(p);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        self.get(id).await
     }
 
     pub async fn list_pending(&self) -> Vec<Proposal> {
