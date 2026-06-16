@@ -11,10 +11,19 @@ encoding/decoding (and, later, signing) against the IC via
 
 | Tool | Args | Returns |
 |------|------|---------|
+| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query` | Reply as textual Candid (anonymous call) |
 | `propose_call` | `canister_id`, `method`, `args` (textual Candid), `is_query` | A proposal id + `/app` URL for the user to review & **sign** |
 | `check_proposal` | `proposal_id` | Status + the signed call's reply as textual Candid |
+
+`discover_canisters` is the entry point when the user names a **website** instead
+of a canister id: it returns the frontend canister (the gateway's
+`x-ic-canister-id` header — authoritative) plus backend/other candidates mined
+from `/env.json` and the JS bundle (labelled where possible). There's no
+authoritative reverse lookup for a site's backend, so non-header results are
+candidates — pick by label (prefer production/`IC_` ids) and confirm with
+`get_candid`.
 
 `call_canister` runs **anonymously**. `propose_call` is how a signed call
 happens: the user reviews and signs it on `/app` with their Internet Identity

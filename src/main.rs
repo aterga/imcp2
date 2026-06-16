@@ -9,6 +9,7 @@
 
 mod auth;
 mod delegation;
+mod discover;
 mod proposals;
 
 use candid::{types::value::IDLArgs, Principal};
@@ -107,6 +108,12 @@ struct ProposeCallArgs {
 struct CheckProposalArgs {
     /// The proposal id returned by `propose_call`.
     proposal_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DiscoverCanistersArgs {
+    /// A web domain or URL served from the IC, e.g. "oisy.com".
+    domain: String,
 }
 
 #[derive(Clone)]
@@ -283,6 +290,39 @@ impl IcTools {
             None => Ok(err(format!("no proposal with id {proposal_id}"))),
         }
     }
+
+    #[tool(
+        description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling."
+    )]
+    async fn discover_canisters(
+        &self,
+        Parameters(DiscoverCanistersArgs { domain }): Parameters<DiscoverCanistersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match discover::discover(&domain).await {
+            Ok(found) if !found.is_empty() => {
+                let mut out = format!("Canisters discovered for {domain}:\n");
+                for f in &found {
+                    out.push_str(&format!(
+                        "- {}{} [{}]\n",
+                        f.canister_id,
+                        f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
+                        f.sources.join(", "),
+                    ));
+                }
+                out.push_str(
+                    "\nThe `header` (x-ic-canister-id) entry is the frontend/asset canister and is \
+                     authoritative. Others come from env.json or the JS bundle and may include \
+                     multiple environments (prefer the production/IC ids). No authoritative \
+                     reverse lookup exists — confirm an interface with get_candid before calling.",
+                );
+                Ok(ok(out))
+            }
+            Ok(_) => Ok(ok(format!(
+                "No IC canisters found for {domain} — is it served from the Internet Computer?"
+            ))),
+            Err(e) => Ok(err(e)),
+        }
+    }
 }
 
 impl IcTools {
@@ -349,7 +389,9 @@ impl ServerHandler for IcTools {
              syntax, e.g. `(record { owner = principal \"aaaaa-aa\"; amount = 5 : nat })`, never \
              the binary form. Before writing Candid args, consult the `candid://textual-syntax` \
              resource (the value syntax these tools use); `candid://reference` has the full type \
-             reference. `get_candid` fetches a canister's Candid interface; `call_canister` calls \
+             reference. When the user names a website/domain instead of a canister id, use \
+             `discover_canisters` to find the canister(s) behind it (frontend via header, \
+             backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface; `call_canister` calls \
              a method anonymously with textual Candid in and out; `propose_call` queues ANY \
              canister call for the user to review and sign with their Internet Identity (the \
              server never signs); `check_proposal` reports the signed call's outcome."

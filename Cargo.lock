@@ -2005,6 +2005,8 @@ dependencies = [
  "ic-representation-independent-hash",
  "ic-signature-verification",
  "p256",
+ "regex",
+ "reqwest",
  "rmcp",
  "schemars 0.8.22",
  "serde",
