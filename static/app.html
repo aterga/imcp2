@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>IC MCP PoC — sign canister calls</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  button { font: inherit; padding: .5rem .9rem; border-radius: .4rem; border: 1px solid #888; background: #f4f4f5; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  code, pre { background: #f4f4f5; border-radius: .3rem; }
+  pre { padding: .75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .75rem 0; }
+  .muted { color: #666; }
+  .card { border: 1px solid #e4e4e7; border-radius: .6rem; padding: 1rem 1.25rem; margin: 1rem 0; }
+  label { display: block; font-size: .85rem; margin: .4rem 0 .15rem; }
+  input { font: inherit; padding: .35rem .5rem; width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: .3rem; }
+</style>
+</head>
+<body>
+<h1>Internet Computer MCP PoC</h1>
+<p class="muted">
+  Sign in with Internet Identity (<code>id.ai</code>) — the same identity that
+  authenticates you to the MCP server is used here to <strong>sign canister
+  calls</strong> directly from this page. The server never holds your key.
+</p>
+
+<div class="card">
+  <div class="row">
+    <button id="login">Sign in with Internet Identity</button>
+    <button id="logout" disabled>Sign out</button>
+  </div>
+  <div>Status: <strong id="status">not signed in</strong></div>
+  <div>Principal: <code id="principal">—</code></div>
+</div>
+
+<div class="card">
+  <strong>Signed canister call</strong>
+  <p class="muted" style="margin:.3rem 0 .6rem">
+    Calls the ICP ledger <code>icrc1_balance_of</code> for your principal. The
+    request is signed by your II identity (not anonymous).
+  </p>
+  <label for="canister">Ledger canister</label>
+  <input id="canister" value="ryjl3-tyaaa-aaaaa-aaaba-cai" />
+  <div class="row" style="margin-top:.6rem">
+    <button id="call" disabled>Check my balance (signed)</button>
+  </div>
+  <pre id="out">(sign in first)</pre>
+</div>
+
+<p class="muted" style="font-size:.85rem">
+  Next: wrap this II login in an OpenID authorize endpoint so the MCP client
+  obtains a token, and build candidate canister calls proposed by the LLM that
+  you approve &amp; sign here.
+</p>
+
+<script type="module">
+import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2";
+import { HttpAgent, Actor } from "https://esm.sh/@dfinity/agent@2";
+
+const II_URL = "https://id.ai";
+const IC_HOST = "https://icp-api.io";
+
+const $ = (id) => document.getElementById(id);
+
+// Minimal IDL for the one method we demonstrate.
+const ledgerIdl = ({ IDL }) => {
+  const Account = IDL.Record({
+    owner: IDL.Principal,
+    subaccount: IDL.Opt(IDL.Vec(IDL.Nat8)),
+  });
+  return IDL.Service({
+    icrc1_balance_of: IDL.Func([Account], [IDL.Nat], ["query"]),
+  });
+};
+
+let authClient = await AuthClient.create();
+
+async function render() {
+  const authed = await authClient.isAuthenticated();
+  const principal = authClient.getIdentity().getPrincipal();
+  $("status").textContent = authed ? "signed in" : "not signed in";
+  $("principal").textContent = authed ? principal.toText() : "—";
+  $("login").disabled = authed;
+  $("logout").disabled = !authed;
+  $("call").disabled = !authed;
+  if (!authed) $("out").textContent = "(sign in first)";
+}
+
+$("login").onclick = async () => {
+  await authClient.login({
+    identityProvider: II_URL,
+    // 8h session; widen/narrow as needed.
+    maxTimeToLive: BigInt(8) * BigInt(3_600_000_000_000),
+    onSuccess: render,
+    onError: (e) => { $("status").textContent = "login error: " + e; },
+  });
+};
+
+$("logout").onclick = async () => {
+  await authClient.logout();
+  await render();
+};
+
+$("call").onclick = async () => {
+  $("out").textContent = "signing & calling…";
+  try {
+    const identity = authClient.getIdentity();
+    const agent = await HttpAgent.create({ identity, host: IC_HOST });
+    const ledger = Actor.createActor(ledgerIdl, {
+      agent,
+      canisterId: $("canister").value.trim(),
+    });
+    const balance = await ledger.icrc1_balance_of({
+      owner: identity.getPrincipal(),
+      subaccount: [],
+    });
+    $("out").textContent =
+      `principal: ${identity.getPrincipal().toText()}\n` +
+      `icrc1_balance_of -> ${balance.toString()} e8s ` +
+      `(${Number(balance) / 1e8} ICP)\n\n` +
+      `This call was signed by your II identity.`;
+  } catch (e) {
+    $("out").textContent = "error: " + (e?.message ?? e);
+  }
+};
+
+await render();
+</script>
+</body>
+</html>

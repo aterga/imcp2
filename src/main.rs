@@ -175,8 +175,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
 <p>Tools: <code>get_candid</code>, <code>call_canister</code> (textual Candid in/out).</p>
-<p>Signing frontend &amp; OpenID auth: coming next.</p>
+<p><a href="/app">Signing frontend</a> — sign in with Internet Identity (id.ai) and sign canister calls.</p>
 </body></html>"#;
+
+const APP_HTML: &str = include_str!("../static/app.html");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -200,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
+        .route("/app", axum::routing::get(|| async { axum::response::Html(APP_HTML) }))
         .nest_service("/mcp", mcp);
 
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
