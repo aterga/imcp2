@@ -130,7 +130,10 @@ pub struct AuthorizeQuery {
 /// `location.search`.
 pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
     if store.validate_client(&q.client_id, &q.redirect_uri).await {
-        Html(AUTHORIZE_HTML).into_response()
+        // Point the login page at the same II instance used by the app
+        // delegation flow (see crate::identities::ii_url).
+        let page = AUTHORIZE_HTML.replace("__II_URL__", &crate::identities::ii_url());
+        Html(page).into_response()
     } else {
         oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri")
     }

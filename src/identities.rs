@@ -9,13 +9,19 @@
 //! for that app*. We then sign canister calls as that identity with `ic-agent`.
 //!
 //! Binding (so a delegation can only land in the session that requested it, and
-//! only via the same browser that authenticated that session):
-//!   * `link`  — in the short URL, bound to the requesting session.
-//!   * `GET /signin/<link>` requires the browser's `mcp_session` cookie to match
-//!     the link's session (blocks a victim opening someone else's link).
-//!   * a `SameSite=None` flow cookie set there is required on the cross-site
-//!     callback POST (blocks completing the flow in a different browser).
+//! only with the user's explicit, informed consent):
+//!   * `link`  — unguessable, single-use, in the short URL, bound to the
+//!     requesting session. Any browser may open it: connector clients (ChatGPT,
+//!     Claude) run OAuth in an isolated/ephemeral browser, so we cannot require a
+//!     shared `mcp_session` cookie when the user later opens the link elsewhere.
+//!   * a `SameSite=None` flow cookie set at `GET /signin/<link>` is required on
+//!     both the cross-site callback POST and the confirm POST (keeps the II
+//!     round-trip in one browser).
 //!   * `state` — single-use, routes the callback to the requesting session.
+//!   * a post-login **confirmation page** shows the *verified* principal + target
+//!     domain before the delegation is stored. A victim phished into opening
+//!     someone else's link must knowingly approve connecting their identity to
+//!     the requesting assistant session — replacing the old cookie binding.
 
 use std::{
     collections::HashMap,
@@ -32,11 +38,25 @@ use ic_agent::{
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-const II_MCP_URL_DEFAULT: &str = "https://uhh2r-oyaaa-aaaad-agbva-cai.icp0.io/mcp";
+/// Single Internet Identity instance used by BOTH the connector sign-in
+/// (`authorize.html`) and the app delegation flow. Override with `II_URL`.
+/// TODO: switch this default to the II staging-B origin once confirmed; the
+/// value below is the previously-used app-delegation II instance so the unified
+/// flow keeps working in the meantime.
+const II_URL_DEFAULT: &str = "https://uhh2r-oyaaa-aaaad-agbva-cai.icp0.io";
 const DEFAULT_TTL_MINUTES: u64 = 60;
 
+/// Origin of the II instance (no trailing path), e.g. `https://<canister>.icp0.io`.
+pub fn ii_url() -> String {
+    std::env::var("II_URL").unwrap_or_else(|_| II_URL_DEFAULT.to_string())
+}
+
+/// II `/mcp` delegation endpoint, derived from [`ii_url`] so the connector login
+/// and the app delegation always target the same instance. `II_MCP_URL` still
+/// overrides it directly if needed.
 fn ii_mcp_url() -> String {
-    std::env::var("II_MCP_URL").unwrap_or_else(|_| II_MCP_URL_DEFAULT.to_string())
+    std::env::var("II_MCP_URL")
+        .unwrap_or_else(|_| format!("{}/mcp", ii_url().trim_end_matches('/')))
 }
 
 /// Where to send the browser after the callback so II's `/mcp` page shows the
@@ -84,11 +104,25 @@ struct PendingState {
     flow: String,
 }
 
+/// A verified delegation awaiting the user's explicit confirmation before it is
+/// stored into the requesting session (see the confirmation page).
+struct PendingDelegation {
+    session_id: String,
+    domain: String,
+    /// Flow cookie that must accompany the confirm POST (same-browser check).
+    flow: String,
+    user_key: Vec<u8>,
+    chain: Vec<SignedDelegation>,
+    expiration_ns: u64,
+    principal: String,
+}
+
 #[derive(Clone, Default)]
 pub struct Identities {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     links: Arc<RwLock<HashMap<String, Link>>>,
     states: Arc<RwLock<HashMap<String, PendingState>>>,
+    pending: Arc<RwLock<HashMap<String, PendingDelegation>>>,
 }
 
 /// One row of `list_identities`.
@@ -133,24 +167,16 @@ impl Identities {
         format!("{}/signin/{}", public_url(), link)
     }
 
-    /// `GET /signin/<link>`: verify the browser owns the link's session, then
-    /// produce the II redirect URL + the flow cookie value to set.
-    pub async fn begin_redirect(
-        &self,
-        link: &str,
-        browser_session_id: Option<&str>,
-    ) -> Result<(String, String), String> {
+    /// `GET /signin/<link>`: consume the single-use link and produce the II
+    /// redirect URL + the flow cookie value to set. Any browser may open the
+    /// link; the user explicitly confirms after logging in (see [`Self::finalize`]).
+    pub async fn begin_redirect(&self, link: &str) -> Result<(String, String), String> {
         let Link { session_id, domain } = self
             .links
             .write()
             .await
             .remove(link)
             .ok_or("unknown or used sign-in link")?;
-
-        match browser_session_id {
-            Some(b) if b == session_id => {}
-            _ => return Err("this sign-in link belongs to a different session".into()),
-        }
 
         let (pubkey_b64, _) = self.pubkey(&session_id).await.ok_or("no session key")?;
         let state = random_token();
@@ -177,14 +203,15 @@ impl Identities {
         Ok((url, flow))
     }
 
-    /// `POST /signin/callback`: verify the flow cookie + state, store the
-    /// delegation under the requesting session/domain.
+    /// `POST /signin/callback`: verify the flow cookie + state, parse the verified
+    /// delegation, and stage it pending the user's explicit confirmation. Returns
+    /// a single-use confirm token routing the browser to the confirmation page.
     pub async fn complete_callback(
         &self,
         state: &str,
         flow_cookie: Option<&str>,
         delegation_json: &str,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let pending = self
             .states
             .write()
@@ -199,17 +226,55 @@ impl Identities {
         let (user_key, chain, expiration_ns) = parse_delegation(delegation_json)?;
         let principal = Principal::self_authenticating(&user_key).to_text();
 
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(&pending.session_id)
-            .ok_or("session vanished")?;
-        session.delegations.insert(
-            pending.domain,
-            Stored {
+        let confirm = random_token();
+        self.pending.write().await.insert(
+            confirm.clone(),
+            PendingDelegation {
+                session_id: pending.session_id,
+                domain: pending.domain,
+                flow: pending.flow,
                 user_key,
                 chain,
                 expiration_ns,
                 principal,
+            },
+        );
+        Ok(confirm)
+    }
+
+    /// The (verified principal, domain) staged under a confirm token, for the
+    /// confirmation page. Does not consume the token.
+    pub async fn confirm_info(&self, confirm: &str) -> Option<(String, String)> {
+        let pending = self.pending.read().await;
+        let p = pending.get(confirm)?;
+        Some((p.principal.clone(), p.domain.clone()))
+    }
+
+    /// `POST /signin/confirm`: the user approved. Verify the flow cookie, then
+    /// store the staged delegation under the requesting session/domain.
+    pub async fn finalize(&self, confirm: &str, flow_cookie: Option<&str>) -> Result<(), String> {
+        let staged = self
+            .pending
+            .write()
+            .await
+            .remove(confirm)
+            .ok_or("unknown or used confirmation")?;
+        match flow_cookie {
+            Some(f) if f == staged.flow => {}
+            _ => return Err("flow cookie missing or mismatched".into()),
+        }
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(&staged.session_id)
+            .ok_or("session vanished")?;
+        session.delegations.insert(
+            staged.domain,
+            Stored {
+                user_key: staged.user_key,
+                chain: staged.chain,
+                expiration_ns: staged.expiration_ns,
+                principal: staged.principal,
             },
         );
         Ok(())
