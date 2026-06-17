@@ -83,9 +83,10 @@ impl AuthStore {
     /// any client_id (rather than requiring it to be pre-registered) keeps the
     /// flow working across server restarts, where Claude Code reuses a cached
     /// dynamically-registered client_id against the in-memory store. The
-    /// redirect_uri is still restricted to loopback to avoid an open redirector.
+    /// redirect_uri is still restricted to loopback plus the ChatGPT and
+    /// Claude.ai hosted connector OAuth callbacks to avoid an open redirector.
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        if !is_loopback_redirect(redirect_uri) {
+        if !is_allowed_redirect(redirect_uri) {
             return false;
         }
         self.clients
@@ -310,12 +311,30 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     Json(body).into_response()
 }
 
-/// Loopback redirect targets only — accept any port (OAuth clients like Claude
-/// Code pick an ephemeral localhost callback port), reject non-local hosts.
+/// Allowed redirect targets: loopback (accept any port — OAuth clients like
+/// Claude Code pick an ephemeral localhost callback port), ChatGPT's connector
+/// OAuth callbacks, and Claude.ai's hosted connector callback (Claude.ai web,
+/// Desktop, mobile, Cowork). Reject anything else to avoid an open redirector
+/// (`approve()` builds its redirect from this URI).
+fn is_allowed_redirect(redirect_uri: &str) -> bool {
+    // The trailing `/` on the ChatGPT prefix and the exact Claude.ai match bind
+    // the host; the loopback hosts need an explicit boundary check (see below).
+    is_loopback_redirect(redirect_uri)
+        || redirect_uri.starts_with("https://chatgpt.com/connector/oauth/")
+        || redirect_uri == "https://claude.ai/api/mcp/auth_callback"
+}
+
+/// `http://<loopback>[:port][/path]`, host matched exactly. A bare `starts_with`
+/// would also accept `http://localhost.evil.com/...` or `http://localhost@evil`,
+/// so require the host to end at a `:` (port), `/` (path), or end of string.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    redirect_uri.starts_with("http://localhost")
-        || redirect_uri.starts_with("http://127.0.0.1")
-        || redirect_uri.starts_with("http://[::1]")
+    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+        .iter()
+        .any(|host| {
+            redirect_uri
+                .strip_prefix(host)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+        })
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -443,7 +462,7 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
-    use super::pkce_s256;
+    use super::{is_allowed_redirect, pkce_s256};
 
     /// RFC 7636 Appendix B test vector.
     #[test]
@@ -451,5 +470,29 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(pkce_s256(verifier), expected);
+    }
+
+    #[test]
+    fn redirect_allowlist_accepts_known_clients() {
+        // Loopback, any port / path (Claude Code picks an ephemeral port).
+        assert!(is_allowed_redirect("http://localhost:1234/cb"));
+        assert!(is_allowed_redirect("http://127.0.0.1:51000/callback"));
+        assert!(is_allowed_redirect("http://[::1]:8080/cb"));
+        assert!(is_allowed_redirect("http://localhost/cb"));
+        // Hosted connector callbacks.
+        assert!(is_allowed_redirect("https://chatgpt.com/connector/oauth/Os40vV-QKzE1"));
+        assert!(is_allowed_redirect("https://claude.ai/api/mcp/auth_callback"));
+    }
+
+    #[test]
+    fn redirect_allowlist_rejects_lookalikes() {
+        // Host-confusion variants must not pass (no open redirector).
+        assert!(!is_allowed_redirect("http://localhost.evil.com/cb"));
+        assert!(!is_allowed_redirect("http://127.0.0.1.evil.com/cb"));
+        assert!(!is_allowed_redirect("http://localhost@evil.com/cb"));
+        assert!(!is_allowed_redirect("https://chatgpt.com.evil.com/connector/oauth/x"));
+        assert!(!is_allowed_redirect("https://chatgpt.com:444/connector/oauth/x"));
+        assert!(!is_allowed_redirect("https://claude.ai/api/mcp/auth_callback/extra"));
+        assert!(!is_allowed_redirect("https://evil.com/cb"));
     }
 }
