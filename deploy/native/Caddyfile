@@ -1,0 +1,6 @@
+{
+  email __ACME_EMAIL__
+}
+__DOMAIN__ {
+  reverse_proxy 127.0.0.1:8000
+}
