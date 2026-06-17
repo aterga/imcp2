@@ -1,0 +1,69 @@
+# TEMPORARY — validates the deploy secrets/connectivity without shipping or
+# restarting anything. Runs on this PR branch only. Delete before merging to main.
+#
+# It exercises the same secrets and SSH setup as deploy.yml, plus a read-only
+# smoke test on the host (whoami / sudo / target dir / service status) and a full
+# arm64 build — but never copies files or restarts services.
+name: Validate deploy (temporary)
+
+on:
+  push:
+    branches: [claude/eager-dirac-bw2fdl]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert required secrets are set
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+          DEPLOY_ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          fail=0
+          for v in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_DOMAIN DEPLOY_ACME_EMAIL DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!v}" ]; then echo "::error::$v is empty"; fail=1; else echo "$v is set"; fi
+          done
+          exit $fail
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: SSH smoke test (read-only)
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" '
+            set -e
+            echo "connected as $(id -un)@$(hostname)"
+            sudo -n true && echo "sudo: ok" || { echo "::error::passwordless sudo not available"; exit 1; }
+            echo "target dir:"; ls -ld /opt/imcp2 2>/dev/null || echo "  /opt/imcp2 not present yet (first deploy will create it)"
+            echo "services:"; systemctl is-active mcp-poc caddy 2>/dev/null || echo "  not installed yet (expected before first deploy)"
+          '
+
+      - name: Verify known_hosts matches the live host key
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          host_only="${HOST##*@}"
+          live="$(ssh-keyscan -T 20 "$host_only" 2>/dev/null | sort)"
+          pinned="$(ssh-keygen -F "$host_only" -f ~/.ssh/known_hosts >/dev/null 2>&1 && echo present || echo missing)"
+          [ "$pinned" = present ] && echo "DEPLOY_KNOWN_HOSTS contains an entry for $host_only" \
+            || { echo "::error::DEPLOY_KNOWN_HOSTS has no entry for $host_only (ssh-keyscan output below)"; echo "$live"; exit 1; }
+
+      - name: Cross-build arm64 binary (no deploy)
+        run: deploy/native/build.sh
