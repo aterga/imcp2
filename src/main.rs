@@ -11,13 +11,11 @@ mod auth;
 mod delegation;
 mod discover;
 mod identities;
-mod proposals;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
 use axum::response::IntoResponse;
 use identities::Identities;
-use proposals::Proposals;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -102,26 +100,6 @@ fn default_identity() -> String {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ProposeCallArgs {
-    /// Target canister principal.
-    canister_id: String,
-    /// Method name to invoke.
-    method: String,
-    /// Arguments in textual Candid syntax (same format as `call_canister`).
-    #[serde(default = "default_args")]
-    args: String,
-    /// If true the user will perform a read-only `query`; otherwise an `update`.
-    #[serde(default)]
-    is_query: bool,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct CheckProposalArgs {
-    /// The proposal id returned by `propose_call`.
-    proposal_id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DiscoverCanistersArgs {
     /// A web domain or URL served from the IC, e.g. "oisy.com".
     domain: String,
@@ -141,20 +119,25 @@ struct ListIdentitiesArgs {
     wait_for: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema, Default)]
+struct SignOutArgs {
+    /// Domain identity to forget, e.g. "oisy.com". Omit to sign out of all.
+    #[serde(default)]
+    domain: Option<String>,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
-    proposals: Proposals,
     identities: Identities,
     tool_router: ToolRouter<IcTools>,
 }
 
 #[tool_router]
 impl IcTools {
-    fn new(agent: Agent, proposals: Proposals, identities: Identities) -> Self {
+    fn new(agent: Agent, identities: Identities) -> Self {
         Self {
             agent,
-            proposals,
             identities,
             tool_router: Self::tool_router(),
         }
@@ -297,84 +280,22 @@ impl IcTools {
         )))
     }
 
-    #[tool(
-        description = "Propose ANY canister call (any canister, any method, textual Candid args — same as call_canister) for the user to review and SIGN with their Internet Identity. This does NOT execute the call; it queues a candidate the user must approve and sign on the signing page. The server does not sign. Returns a proposal id and review URL; poll `check_proposal` for the outcome."
-    )]
-    async fn propose_call(
+    #[tool(description = "Sign out of a domain identity (forget its delegation). Pass a domain to forget that one, or omit to sign out of all. Anonymous always remains.")]
+    async fn sign_out(
         &self,
-        Parameters(ProposeCallArgs {
-            canister_id,
-            method,
-            args,
-            is_query,
-        }): Parameters<ProposeCallArgs>,
+        Parameters(SignOutArgs { domain }): Parameters<SignOutArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let principal = match Principal::from_text(&canister_id) {
-            Ok(p) => p,
-            Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
+        let session_id = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("sign_out needs an authenticated session".into())),
         };
-        // Validate the textual Candid parses, so malformed args fail at proposal
-        // time. The actual encoding happens in the browser (what-you-see-is-
-        // what-you-sign) — the server never produces the bytes that get signed.
-        if let Err(e) = candid_parser::parse_idl_args(&args) {
-            return Ok(err(format!("could not parse args `{args}`: {e}")));
-        }
-
-        // Best-effort fetch of the canister's interface so the browser can
-        // encode/decode this call with field names (recovering hashed fields).
-        let did = self
-            .agent
-            .read_state_canister_metadata(principal, "candid:service")
-            .await
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok());
-
-        let proposer = authed_principal(&ctx).unwrap_or_else(|| "unknown".to_string());
-        let p = self
-            .proposals
-            .create_call(canister_id, method, args, is_query, proposer, did)
-            .await;
-
-        let url = format!("{}/app", auth::base_url());
-        Ok(ok(format!(
-            "Proposed call (NOT executed — awaiting the user's signature).\n\
-             proposal_id: {}\n\
-             {} {} {}\n\
-             Ask the user to review and sign it at: {}\n\
-             Then call check_proposal with this proposal_id — it will WAIT for the \
-             signature and return the result. If it comes back still pending, call \
-             check_proposal again.",
-            p.id,
-            if p.is_query { "query" } else { "update" },
-            p.method,
-            p.args,
-            url
-        )))
-    }
-
-    #[tool(
-        description = "Check a proposal created with propose_call. Waits up to ~25s for the user to sign and returns the result (textual Candid) as soon as it's available; if it returns while still pending, call it again."
-    )]
-    async fn check_proposal(
-        &self,
-        Parameters(CheckProposalArgs { proposal_id }): Parameters<CheckProposalArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let waited = self
-            .proposals
-            .wait_for_result(&proposal_id, std::time::Duration::from_secs(25))
-            .await;
-        match waited {
-            Some(p) => Ok(ok(format!(
-                "status: {}\ncall: {} {} {}\nresult: {}",
-                p.status,
-                if p.is_query { "query" } else { "update" },
-                p.method,
-                p.args,
-                p.result.unwrap_or_else(|| "(none yet)".into())
-            ))),
-            None => Ok(err(format!("no proposal with id {proposal_id}"))),
-        }
+        let removed = self.identities.sign_out(&session_id, domain.as_deref()).await;
+        Ok(ok(match domain {
+            Some(d) if removed > 0 => format!("Signed out of {d}."),
+            Some(d) => format!("Was not signed in to {d}."),
+            None => format!("Signed out of all {removed} domain identities."),
+        }))
     }
 
     #[tool(
@@ -454,17 +375,13 @@ fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String
     Some(decoded.to_string())
 }
 
-/// The authenticated MCP session (principal + session id) of the calling
-/// request, if it carried a valid bearer token (injected by [`auth::require_token`]).
+/// The authenticated MCP session of the calling request, if it carried a valid
+/// bearer token (injected by [`auth::require_token`]).
 fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSession> {
     ctx.extensions
         .get::<axum::http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<auth::AuthedSession>())
         .cloned()
-}
-
-fn authed_principal(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    authed_session(ctx).map(|s| s.principal)
 }
 
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
@@ -620,11 +537,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (anonymous), <code>propose_call</code> / <code>check_proposal</code> (sign via Internet Identity). All speak textual Candid.</p>
-<p><a href="/app">Signing frontend</a> — sign in with Internet Identity (id.ai) and sign canister calls.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as anonymous or a signed-in domain), <code>list_identities</code>, <code>sign_in</code> / <code>sign_out</code> (Internet Identity per domain). All speak textual Candid.</p>
 </body></html>"#;
-
-const APP_HTML: &str = include_str!("../static/app.html");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -639,16 +553,14 @@ async fn main() -> anyhow::Result<()> {
     let agent = Agent::builder().with_url(IC_URL).build()?;
     tracing::info!("built ic-agent against {IC_URL}");
 
-    let proposals = Proposals::default();
     let identities = Identities::new();
 
     let ct = tokio_util::sync::CancellationToken::new();
     let mcp = {
         let agent = agent.clone();
-        let proposals = proposals.clone();
         let identities = identities.clone();
         StreamableHttpService::new(
-            move || Ok(IcTools::new(agent.clone(), proposals.clone(), identities.clone())),
+            move || Ok(IcTools::new(agent.clone(), identities.clone())),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
                 .with_cancellation_token(ct.child_token())
@@ -663,15 +575,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/signin/{link}", axum::routing::get(signin_redirect))
         .route("/signin/callback", axum::routing::post(signin_callback))
         .with_state(identities.clone());
-
-    // Browser-facing proposal API used by /app (signer reviews & reports outcome).
-    let api = axum::Router::new()
-        .route("/api/proposals", axum::routing::get(proposals::list_pending))
-        .route(
-            "/api/proposals/{id}/result",
-            axum::routing::post(proposals::submit_result),
-        )
-        .with_state(proposals.clone());
 
     // /mcp is gated by a bearer token issued after Internet Identity login.
     let protected_mcp = axum::Router::new()
@@ -705,10 +608,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
-        .route("/app", axum::routing::get(|| async { axum::response::Html(APP_HTML) }))
-        // Browser-side Candid codec (Rust compiled to WASM) served for /app.
-        .nest_service("/wasm", tower_http::services::ServeDir::new("static/wasm"))
-        .merge(api)
         .merge(signin)
         .merge(oauth)
         .merge(protected_mcp);

@@ -13,21 +13,20 @@ encoding/decoding (and, later, signing) against the IC via
 |------|------|---------|
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query` | Reply as textual Candid (anonymous call) |
-| `propose_call` | `canister_id`, `method`, `args` (textual Candid), `is_query` | A proposal id + `/app` URL for the user to review & **sign** |
-| `check_proposal` | `proposal_id` | Status + the signed call's reply as textual Candid |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `identity` | Reply as textual Candid, called as `anonymous` or a signed-in domain |
+| `list_identities` | `wait_for?` | `anonymous` + every signed-in domain (principal + validity); waits for a pending sign-in when `wait_for` is set |
+| `sign_in` | `domain` | A short URL the user opens to authorize that domain via Internet Identity |
+| `sign_out` | `domain?` | Forget a domain's delegation (or all) |
 
 `discover_canisters` is the entry point when the user names a **website** instead
-of a canister id: it returns the frontend canister (the gateway's
-`x-ic-canister-id` header — authoritative) plus backend/other candidates mined
-from `/env.json` and the JS bundle (labelled where possible). There's no
-authoritative reverse lookup for a site's backend, so non-header results are
-candidates — pick by label (prefer production/`IC_` ids) and confirm with
-`get_candid`.
+of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
+backend candidates mined from `/env.json` + the JS bundle (pick by label, prefer
+production/`IC_` ids, confirm with `get_candid`).
 
-`call_canister` runs **anonymously**. `propose_call` is how a signed call
-happens: the user reviews and signs it on `/app` with their Internet Identity
-(see below). `propose_call` / `check_proposal` require a bearer token.
+`call_canister` runs as `identity` — `anonymous` by default, or a domain you've
+signed into. `sign_in(domain)` returns a URL the user opens; after they approve
+in II, that domain becomes available as an `identity`. All these tools require a
+bearer token (see Auth).
 
 ## Connect from an MCP client
 
@@ -51,12 +50,12 @@ cargo run
 
 ## Deploy
 
-The server is a single binary plus the `static/` assets (the WASM Candid codec
-is prebuilt and committed). Two requirements when hosting:
+The server is a single binary plus the `static/` assets. Two requirements when hosting:
 
 - **HTTPS** — the id.ai passkey (WebAuthn) only works in a secure context.
 - **`PUBLIC_URL`** — set it to the public https URL; it's used in the OAuth
-  discovery documents, the `/app` link, and the allowed-Host list.
+  discovery documents, the sign-in redirect/callback, and the allowed-Host list.
+  (II's `mcp_server_origin` must be configured to this exact origin.)
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
 zero-signup public URL during testing, expose the local server with a tunnel:
@@ -121,48 +120,40 @@ let one user read another's session. (Fund safety is independent: that's
 enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
 codes live 120s, nonces 300s, access tokens 1h.
 
-Set the public base URL (used in discovery docs) with `PUBLIC_URL`
-(default `http://localhost:8000`).
+Set the public base URL (used in discovery docs + the sign-in redirect) with
+`PUBLIC_URL`; point the II `/mcp` flow at a deployment with `II_MCP_URL`
+(defaults to the staging II canister).
+
+## Domain identities (II `/mcp` delegation)
+
+Instead of signing each call in the browser, the MCP server holds a **per-session
+Ed25519 key** and obtains a **delegation** from Internet Identity that acts as
+the user's *default account for an app* (II PR
+[dfinity/internet-identity#4026](https://github.com/dfinity/internet-identity/pull/4026)).
+The server then signs calls as that identity with `ic-agent`'s `DelegatedIdentity`.
+
+Flow:
+1. `sign_in("oisy.com")` → a short `…/signin/<link>` URL the user opens.
+2. `GET /signin/<link>` checks the browser's `mcp_session` cookie matches the
+   link's session, sets a `SameSite=None` flow cookie, and redirects to II's
+   `/mcp` (`#public_key&callback&state&app&ttl`).
+3. II consent → top-level form-POST of the delegation chain to
+   `/signin/callback`, which verifies the flow cookie + single-use `state` and
+   stores the delegation under that session + domain.
+4. `call_canister(identity="oisy.com", …)` now signs as the user's oisy account.
+
+**Binding:** the delegation can only land in the session that requested it
+(`state`), and only via the same browser that authenticated that session
+(`mcp_session` cookie at `GET /signin`, `SameSite=None` flow cookie on the
+callback) — so a shared sign-in link can't be completed for someone else.
 
 ## Roadmap
 
-- [x] Two Candid tools over MCP streamable-HTTP, anonymous calls.
-- [x] OpenID/OAuth auth between MCP client and server; authorize page logs in
-      via `@dfinity/auth-client` against **id.ai** instead of username/password,
-      token bound to the II principal.
-- [x] Frontend page (`/app`) where the same II identity **signs** canister
-      calls client-side; the server never holds the key.
-- [x] Verify a signed II **delegation** server-side so the principal is real,
-      not browser-asserted (`src/delegation.rs`, unit-tested).
-- [x] Enforce PKCE (S256); expire codes / nonces / tokens.
-- [x] LLM proposes ANY canister call (`propose_call`); the user reviews &
-      **signs it on `/app`** with their II identity. The browser encodes the
-      textual Candid locally via Rust-compiled-to-WASM (`candid-wasm/`) and
-      decodes the reply locally — what-you-see-is-what-you-sign, with the
-      untrusted server never in the encode/decode/sign path.
-
-## Propose → sign → execute loop
-
-`propose_call(canister_id, method, args, is_query)` (authenticated MCP tool)
-queues a candidate call bound to the verified principal and returns a proposal
-id + the `/app` URL. It does **not** execute anything. On `/app`, after II
-login, pending proposals are listed; the user reviews the textual Candid and
-clicks sign — the browser:
-
-1. encodes the displayed textual Candid args to bytes locally (WASM);
-2. signs & submits the call to the IC with the II identity (`agent.query` /
-   `agent.call`);
-3. decodes the reply locally (WASM) and posts the textual outcome back.
-
-The LLM reads the result with `check_proposal(proposal_id)`. The server only
-brokers the proposal text and records the outcome — it holds no key and never
-produces the bytes that get signed.
-
-### Building the WASM codec
-
-```bash
-wasm-pack build candid-wasm --target web --release -d ../static/wasm
-```
-
-(The built artifacts are committed under `static/wasm/` so the server runs
-out of the box.)
+- [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
+      reference resources.
+- [x] OpenID/OAuth auth (authorize page logs in via `@dfinity/auth-client`
+      against **id.ai**); verified II delegation; PKCE; expiring tokens.
+- [x] Per-session **domain identities** via II's `/mcp` delegation flow
+      (`sign_in` / `sign_out` / `list_identities`; `call_canister` `identity`).
+- [ ] Persist sessions/delegations (currently in-memory, lost on restart).
+- [ ] Scoped delegations / per-call confirmation for sensitive methods.

@@ -215,6 +215,20 @@ impl Identities {
         Ok(())
     }
 
+    /// Forget a domain's delegation (or all of them). Returns how many were removed.
+    pub async fn sign_out(&self, session_id: &str, domain: Option<&str>) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let Some(s) = sessions.get_mut(session_id) else { return 0 };
+        match domain {
+            Some(d) => s.delegations.remove(d).is_some() as usize,
+            None => {
+                let n = s.delegations.len();
+                s.delegations.clear();
+                n
+            }
+        }
+    }
+
     async fn pubkey(&self, session_id: &str) -> Option<(String, Vec<u8>)> {
         let sessions = self.sessions.read().await;
         let s = sessions.get(session_id)?;

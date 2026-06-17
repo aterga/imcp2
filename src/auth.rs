@@ -397,7 +397,6 @@ pub async fn protected_resource_metadata() -> Response {
 /// per-session delegated identities.
 #[derive(Clone, Debug)]
 pub struct AuthedSession {
-    pub principal: String,
     pub session_id: String,
 }
 
@@ -416,7 +415,8 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
 
     match session {
         Some((principal, session_id)) => {
-            request.extensions_mut().insert(AuthedSession { principal, session_id });
+            tracing::debug!(%principal, %session_id, "authenticated MCP request");
+            request.extensions_mut().insert(AuthedSession { session_id });
             next.run(request).await
         }
         None => {
