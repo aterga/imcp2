@@ -462,9 +462,11 @@ struct ConfirmQuery {
 /// to explicitly approve connecting it to the requesting assistant session.
 async fn signin_confirm_page(
     axum::extract::State(identities): axum::extract::State<Identities>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ConfirmQuery>,
 ) -> axum::response::Response {
-    match identities.confirm_info(&q.c).await {
+    let flow = cookie_value(&headers, "mcp_flow");
+    match identities.confirm_info(&q.c, flow.as_deref()).await {
         Some((principal, domain)) => {
             axum::response::Html(render_confirm_page(&q.c, &principal, &domain)).into_response()
         }
@@ -515,6 +517,7 @@ fn render_confirm_page(confirm: &str, principal: &str, domain: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>Confirm sign-in</title></head>
 <body style="font-family:system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5">
 <h2>Confirm sign-in to {domain}</h2>

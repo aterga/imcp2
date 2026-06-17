@@ -131,8 +131,14 @@ pub struct AuthorizeQuery {
 pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
     if store.validate_client(&q.client_id, &q.redirect_uri).await {
         // Point the login page at the same II instance used by the app
-        // delegation flow (see crate::identities::ii_url).
-        let page = AUTHORIZE_HTML.replace("__II_URL__", &crate::identities::ii_url());
+        // delegation flow (see crate::identities::ii_url). Escape for the JS
+        // string literal it lands in so a stray `"`/`\`/`</script>` in config
+        // can't break out of the string.
+        let ii = crate::identities::ii_url()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('<', "\\x3c");
+        let page = AUTHORIZE_HTML.replace("__II_URL__", &ii);
         Html(page).into_response()
     } else {
         oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri")

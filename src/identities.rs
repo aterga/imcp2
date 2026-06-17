@@ -40,23 +40,23 @@ use tokio::sync::RwLock;
 
 /// Single Internet Identity instance used by BOTH the connector sign-in
 /// (`authorize.html`) and the app delegation flow. Override with `II_URL`.
-/// TODO: switch this default to the II staging-B origin once confirmed; the
-/// value below is the previously-used app-delegation II instance so the unified
-/// flow keeps working in the meantime.
+/// Default: II **staging-B** (frontend canister `uhh2r-oyaaa-aaaad-agbva-cai`).
 const II_URL_DEFAULT: &str = "https://uhh2r-oyaaa-aaaad-agbva-cai.icp0.io";
 const DEFAULT_TTL_MINUTES: u64 = 60;
+/// How long a staged-but-unconfirmed delegation lives before it's discarded.
+const PENDING_TTL_NS: u64 = 10 * 60 * 1_000_000_000;
 
-/// Origin of the II instance (no trailing path), e.g. `https://<canister>.icp0.io`.
+/// Origin of the II instance (no trailing slash), e.g. `https://<canister>.icp0.io`.
 pub fn ii_url() -> String {
-    std::env::var("II_URL").unwrap_or_else(|_| II_URL_DEFAULT.to_string())
+    let raw = std::env::var("II_URL").unwrap_or_else(|_| II_URL_DEFAULT.to_string());
+    raw.trim_end_matches('/').to_string()
 }
 
 /// II `/mcp` delegation endpoint, derived from [`ii_url`] so the connector login
 /// and the app delegation always target the same instance. `II_MCP_URL` still
 /// overrides it directly if needed.
 fn ii_mcp_url() -> String {
-    std::env::var("II_MCP_URL")
-        .unwrap_or_else(|_| format!("{}/mcp", ii_url().trim_end_matches('/')))
+    std::env::var("II_MCP_URL").unwrap_or_else(|_| format!("{}/mcp", ii_url()))
 }
 
 /// Where to send the browser after the callback so II's `/mcp` page shows the
@@ -109,12 +109,14 @@ struct PendingState {
 struct PendingDelegation {
     session_id: String,
     domain: String,
-    /// Flow cookie that must accompany the confirm POST (same-browser check).
+    /// Flow cookie that must accompany the confirm GET/POST (same-browser check).
     flow: String,
     user_key: Vec<u8>,
     chain: Vec<SignedDelegation>,
     expiration_ns: u64,
     principal: String,
+    /// When staged, for bounding the lifetime of unconfirmed entries.
+    created_ns: u64,
 }
 
 #[derive(Clone, Default)]
@@ -227,7 +229,12 @@ impl Identities {
         let principal = Principal::self_authenticating(&user_key).to_text();
 
         let confirm = random_token();
-        self.pending.write().await.insert(
+        let now = now_ns();
+        let mut staged = self.pending.write().await;
+        // Opportunistically drop abandoned (never-confirmed) entries so the map
+        // stays bounded without a background task.
+        staged.retain(|_, p| now.saturating_sub(p.created_ns) < PENDING_TTL_NS);
+        staged.insert(
             confirm.clone(),
             PendingDelegation {
                 session_id: pending.session_id,
@@ -237,21 +244,31 @@ impl Identities {
                 chain,
                 expiration_ns,
                 principal,
+                created_ns: now,
             },
         );
         Ok(confirm)
     }
 
     /// The (verified principal, domain) staged under a confirm token, for the
-    /// confirmation page. Does not consume the token.
-    pub async fn confirm_info(&self, confirm: &str) -> Option<(String, String)> {
+    /// confirmation page. Requires the matching flow cookie (same-browser bind)
+    /// and a non-expired entry. Does not consume the token.
+    pub async fn confirm_info(
+        &self,
+        confirm: &str,
+        flow_cookie: Option<&str>,
+    ) -> Option<(String, String)> {
         let pending = self.pending.read().await;
         let p = pending.get(confirm)?;
-        Some((p.principal.clone(), p.domain.clone()))
+        let fresh = now_ns().saturating_sub(p.created_ns) < PENDING_TTL_NS;
+        match flow_cookie {
+            Some(f) if f == p.flow && fresh => Some((p.principal.clone(), p.domain.clone())),
+            _ => None,
+        }
     }
 
-    /// `POST /signin/confirm`: the user approved. Verify the flow cookie, then
-    /// store the staged delegation under the requesting session/domain.
+    /// `POST /signin/confirm`: the user approved. Verify the flow cookie + that
+    /// the entry hasn't expired, then store the delegation under the session.
     pub async fn finalize(&self, confirm: &str, flow_cookie: Option<&str>) -> Result<(), String> {
         let staged = self
             .pending
@@ -262,6 +279,9 @@ impl Identities {
         match flow_cookie {
             Some(f) if f == staged.flow => {}
             _ => return Err("flow cookie missing or mismatched".into()),
+        }
+        if now_ns().saturating_sub(staged.created_ns) >= PENDING_TTL_NS {
+            return Err("confirmation expired — start sign-in again".into());
         }
 
         let mut sessions = self.sessions.write().await;
