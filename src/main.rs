@@ -392,15 +392,14 @@ fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// GET /signin/{link} — verify the browser owns the link's session, set a flow
-/// cookie, and redirect to II's /mcp delegation flow.
+/// GET /signin/{link} — consume the single-use link, set a flow cookie, and
+/// redirect to II's /mcp delegation flow. The link opens in any browser; the
+/// user confirms the verified identity afterward (see `signin_confirm_*`).
 async fn signin_redirect(
     axum::extract::State(identities): axum::extract::State<Identities>,
     axum::extract::Path(link): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let browser_session = cookie_value(&headers, "mcp_session");
-    match identities.begin_redirect(&link, browser_session.as_deref()).await {
+    match identities.begin_redirect(&link).await {
         Ok((url, flow)) => {
             let cookie = format!(
                 "mcp_flow={flow}; Path=/signin; HttpOnly; Secure; SameSite=None; Max-Age=600"
@@ -425,25 +424,114 @@ struct CallbackForm {
 }
 
 /// POST /signin/callback — II form-POSTs the delegation here; verify flow cookie
-/// + state, store the delegation, then send the browser back to II with a status.
+/// + state, stage the verified delegation, then send the browser to the
+/// confirmation page (which shows the principal + domain before it lands).
 async fn signin_callback(
     axum::extract::State(identities): axum::extract::State<Identities>,
     headers: axum::http::HeaderMap,
     axum::extract::Form(form): axum::extract::Form<CallbackForm>,
 ) -> axum::response::Response {
     let flow = cookie_value(&headers, "mcp_flow");
-    let ok = identities
+    let location = match identities
         .complete_callback(&form.state, flow.as_deref(), &form.delegation)
-        .await;
-    let status_url = identities::ii_status_url(ok.is_ok());
-    if let Err(e) = ok {
-        tracing::warn!("sign-in callback rejected: {e}");
+        .await
+    {
+        Ok(confirm) => format!(
+            "{}/signin/confirm?c={}",
+            auth::base_url(),
+            urlencoding::encode(&confirm)
+        ),
+        Err(e) => {
+            tracing::warn!("sign-in callback rejected: {e}");
+            identities::ii_status_url(false)
+        }
+    };
+    (
+        axum::http::StatusCode::SEE_OTHER,
+        [(axum::http::header::LOCATION, location)],
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ConfirmQuery {
+    c: String,
+}
+
+/// GET /signin/confirm — show the verified principal + domain and ask the user
+/// to explicitly approve connecting it to the requesting assistant session.
+async fn signin_confirm_page(
+    axum::extract::State(identities): axum::extract::State<Identities>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ConfirmQuery>,
+) -> axum::response::Response {
+    let flow = cookie_value(&headers, "mcp_flow");
+    match identities.confirm_info(&q.c, flow.as_deref()).await {
+        Some((principal, domain)) => {
+            axum::response::Html(render_confirm_page(&q.c, &principal, &domain)).into_response()
+        }
+        None => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "unknown or used confirmation",
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ConfirmForm {
+    confirm: String,
+}
+
+/// POST /signin/confirm — the user approved; verify the flow cookie, store the
+/// delegation under the requesting session, then return to II's status page.
+async fn signin_confirm_submit(
+    axum::extract::State(identities): axum::extract::State<Identities>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Form(form): axum::extract::Form<ConfirmForm>,
+) -> axum::response::Response {
+    let flow = cookie_value(&headers, "mcp_flow");
+    let ok = identities.finalize(&form.confirm, flow.as_deref()).await;
+    if let Err(e) = &ok {
+        tracing::warn!("sign-in confirm rejected: {e}");
     }
     (
         axum::http::StatusCode::SEE_OTHER,
-        [(axum::http::header::LOCATION, status_url)],
+        [(axum::http::header::LOCATION, identities::ii_status_url(ok.is_ok()))],
     )
         .into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn render_confirm_page(confirm: &str, principal: &str, domain: &str) -> String {
+    let domain = html_escape(domain);
+    let principal = html_escape(principal);
+    let confirm = html_escape(confirm);
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Confirm sign-in</title></head>
+<body style="font-family:system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5">
+<h2>Confirm sign-in to {domain}</h2>
+<p>You signed in as:</p>
+<p style="font-family:ui-monospace,monospace;word-break:break-all;background:#f4f4f5;padding:.5rem .75rem;border-radius:.5rem">{principal}</p>
+<p>Confirming lets the AI assistant session that requested this sign-in act as this
+identity on <b>{domain}</b>. Only continue if <b>you</b> started this from your assistant.</p>
+<form method="post" action="/signin/confirm">
+<input type="hidden" name="confirm" value="{confirm}">
+<button type="submit" style="padding:.6rem 1.2rem;font-size:1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Confirm and connect</button>
+</form>
+<p style="color:#71717a;font-size:.85rem;margin-top:1rem">If you didn't start this, just close this page — nothing will be connected.</p>
+</body></html>"#
+    )
 }
 
 /// Perform a query or update call and return the raw Candid reply bytes.
@@ -562,7 +650,13 @@ async fn main() -> anyhow::Result<()> {
         StreamableHttpService::new(
             move || Ok(IcTools::new(agent.clone(), identities.clone())),
             LocalSessionManager::default().into(),
+            // Stateless + plain-JSON responses: our tools are pure request/response
+            // with no server-initiated messages, and this is the most compatible
+            // mode across MCP clients (ChatGPT's connector does not complete the
+            // stateful SSE/session handshake that the rmcp defaults require).
             StreamableHttpServerConfig::default()
+                .with_stateful_mode(false)
+                .with_json_response(true)
                 .with_cancellation_token(ct.child_token())
                 .with_allowed_hosts(allowed_hosts()),
         )
@@ -574,6 +668,10 @@ async fn main() -> anyhow::Result<()> {
     let signin = axum::Router::new()
         .route("/signin/{link}", axum::routing::get(signin_redirect))
         .route("/signin/callback", axum::routing::post(signin_callback))
+        .route(
+            "/signin/confirm",
+            axum::routing::get(signin_confirm_page).post(signin_confirm_submit),
+        )
         .with_state(identities.clone());
 
     // /mcp is gated by a bearer token issued after Internet Identity login.
