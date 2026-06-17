@@ -52,6 +52,41 @@ public IPv4, attach a **second ENI in a public subnet** (route table `0.0.0.0/0 
 and associate an Elastic IP; AL2023's `amazon-ec2-net-utils` auto-configures the
 source-based policy routing for the secondary interface. Point `$DOMAIN` at that EIP.
 
+## Handing this off (deploying via a Claude Code session)
+
+If you want someone else to run the deploy in a Claude session, here's what they
+need ready and what to prompt. **Note that SSH access ≠ public web reachability** —
+being able to `ssh` in does not mean 80/443 are reachable from the internet.
+
+**Have ready:**
+1. An EC2 instance already launched — **Amazon Linux 2023, arm64** (Graviton).
+2. SSH access as a sudo-capable user (`ec2-user`); confirm `ssh ec2-user@<host>` works.
+3. This repo checked out locally (with `deploy/native/`).
+4. **Docker running on their workstation** (for the cross-build in `build.sh`).
+5. A domain (FQDN) + an ACME email for Let's Encrypt.
+6. **DNS already set**: `A`/`AAAA` for the domain → the instance's public address.
+7. **Inbound 80 + 443 open to the internet**, verified from an outside network.
+8. *Only if the box isn't already publicly reachable* (e.g. private/managed subnet):
+   AWS CLI creds with EC2 networking permissions — Claude must first build the public
+   path (public subnet → IGW, secondary ENI, Elastic IP, SG for 80/443/22). See the
+   networking note above.
+
+**Prompt (box already publicly reachable):**
+
+> Do a native (no-Docker) deploy of `mcp-poc` to my EC2 instance using `deploy/native`.
+> - Repo: `/path/to/imcp2`
+> - Host: `ec2-user@<ip-or-fqdn>` — I have SSH key trust, sudo works
+> - Domain: `mcp.example.com`, with `A`/`AAAA` already pointing at the host
+> - ACME email: `you@example.com`
+> - Amazon Linux 2023, arm64; inbound 80/443 already open to the internet.
+>
+> Cross-build with `deploy/native/build.sh`, then run `deploy/native/deploy.sh`.
+> Verify the cert issues and `https://mcp.example.com/` returns 200 from outside.
+
+**If the instance is in a private subnet,** also tell Claude the instance id + region,
+that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
+the box publicly reachable and report the address to set DNS *before* the deploy.
+
 ## Operating
 
 ```sh
