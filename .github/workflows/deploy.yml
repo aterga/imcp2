@@ -1,0 +1,65 @@
+# Auto-redeploy mcp-poc on every push to main.
+#
+# Reuses the existing native (Docker-free) deploy under deploy/native: cross-builds
+# the linux/arm64 binary, then ships it + static/ over SSH and (re)starts the systemd
+# services on the target host. See deploy/native/README.md for the deploy model.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   DEPLOY_SSH_KEY    private SSH key (PEM/OpenSSH) for a sudo-capable user on the host
+#   DEPLOY_HOST       user@host, e.g. ec2-user@1.2.3.4   (matches deploy.sh's HOST)
+#   DEPLOY_DOMAIN     public FQDN served over HTTPS, e.g. mcp.example.com
+#   DEPLOY_ACME_EMAIL email for Let's Encrypt / ACME
+# Optional:
+#   DEPLOY_KNOWN_HOSTS  host public keys (output of `ssh-keyscan <host>`). If unset,
+#                       the host key is fetched at run time via ssh-keyscan (TOFU).
+name: Deploy main
+
+on:
+  push:
+    branches: [main]
+  # Allow manually re-running the deploy from the Actions tab.
+  workflow_dispatch:
+
+# Never run two deploys at once; let an in-flight deploy finish rather than cancel it.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # arm64 runner: build.sh produces a linux/arm64 binary, so building natively here
+    # (vs. emulating under QEMU on x86) is far faster. The bullseye build container in
+    # build.sh still pins glibc 2.31 for Amazon Linux 2023 compatibility.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cross-build arm64 binary
+        run: deploy/native/build.sh
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${HOST##*@}" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+          ACME_EMAIL: ${{ secrets.DEPLOY_ACME_EMAIL }}
+        run: deploy/native/deploy.sh

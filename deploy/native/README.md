@@ -87,6 +87,26 @@ being able to `ssh` in does not mean 80/443 are reachable from the internet.
 that there's no public IPv4 inbound, and that AWS creds are granted — ask it to make
 the box publicly reachable and report the address to set DNS *before* the deploy.
 
+## Automated redeploy on push to `main`
+
+[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs this same
+native deploy automatically on every push to `main` (and can be re-run by hand from the
+Actions tab). It cross-builds the arm64 binary with `build.sh`, then runs `deploy.sh`
+over SSH. A `concurrency` group serializes deploys so two never overlap.
+
+Configure these repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Value |
+|---|---|
+| `DEPLOY_SSH_KEY` | Private SSH key for the sudo-capable host user (e.g. `ec2-user`) |
+| `DEPLOY_HOST` | `user@host`, e.g. `ec2-user@1.2.3.4` (the `HOST` deploy.sh expects) |
+| `DEPLOY_DOMAIN` | Public FQDN served over HTTPS, e.g. `mcp.example.com` |
+| `DEPLOY_ACME_EMAIL` | Email for Let's Encrypt / ACME |
+| `DEPLOY_KNOWN_HOSTS` | *(optional)* output of `ssh-keyscan <host>`; pin it to avoid trust-on-first-use. If omitted, the host key is fetched at run time. |
+
+The host prerequisites above (DNS, inbound 80/443, sudo SSH user) still apply — the
+workflow only automates the build-and-ship step, not provisioning the box.
+
 ## Operating
 
 ```sh
