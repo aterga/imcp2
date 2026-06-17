@@ -56,6 +56,10 @@ struct CodeGrant {
     scope: Option<String>,
     /// Verified Internet Identity principal.
     principal: String,
+    /// Browser/session id minted at approve, set as the `mcp_session` cookie and
+    /// carried to the issued token, so the same browser can later be required to
+    /// own a domain sign-in.
+    session_id: String,
     code_challenge: Option<String>,
     created: Instant,
 }
@@ -63,6 +67,7 @@ struct CodeGrant {
 #[derive(Clone, Debug)]
 struct TokenInfo {
     principal: String,
+    session_id: String,
     created: Instant,
 }
 
@@ -91,12 +96,13 @@ impl AuthStore {
         true
     }
 
-    /// The verified principal behind a bearer token, if valid and unexpired.
-    pub async fn principal_for_token(&self, token: &str) -> Option<String> {
+    /// The verified principal + session id behind a bearer token, if valid.
+    pub async fn session_for_token(&self, token: &str) -> Option<(String, String)> {
         let tokens = self.tokens.read().await;
         let info = tokens.get(token)?;
-        (info.created.elapsed() < TOKEN_TTL).then(|| info.principal.clone())
+        (info.created.elapsed() < TOKEN_TTL).then(|| (info.principal.clone(), info.session_id.clone()))
     }
+
 }
 
 // ---- Nonce: server-issued challenge for the login proof ----------------
@@ -186,12 +192,14 @@ pub async fn approve(State(store): State<AuthStore>, Json(body): Json<ApproveBod
     };
 
     let code = format!("mcp-code-{}", Uuid::new_v4());
+    let session_id = format!("sess-{}", Uuid::new_v4());
     store.codes.write().await.insert(
         code.clone(),
         CodeGrant {
             client_id: body.client_id.clone(),
             scope: (!body.scope.is_empty()).then(|| body.scope.clone()),
             principal: principal.clone(),
+            session_id: session_id.clone(),
             code_challenge: body.code_challenge.clone(),
             created: Instant::now(),
         },
@@ -202,7 +210,17 @@ pub async fn approve(State(store): State<AuthStore>, Json(body): Json<ApproveBod
     if !body.state.is_empty() {
         redirect.push_str(&format!("&state={}", body.state));
     }
-    Json(json!({ "redirect": redirect })).into_response()
+    // Bind this browser to the session (set during the same-origin approve fetch)
+    // so it can later be required to own a domain sign-in. Lax: sent on the
+    // first-party top-level GET /signin navigation.
+    let cookie = format!(
+        "mcp_session={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400"
+    );
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(json!({ "redirect": redirect })),
+    )
+        .into_response()
 }
 
 fn verify_login_proof(body: &ApproveBody) -> Result<candid::Principal, String> {
@@ -273,7 +291,11 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     let access_token = format!("mcp-token-{}", Uuid::new_v4());
     store.tokens.write().await.insert(
         access_token.clone(),
-        TokenInfo { principal: grant.principal.clone(), created: Instant::now() },
+        TokenInfo {
+            principal: grant.principal.clone(),
+            session_id: grant.session_id.clone(),
+            created: Instant::now(),
+        },
     );
     tracing::info!(principal = %grant.principal, "issued MCP access token");
 
@@ -370,10 +392,14 @@ pub async fn protected_resource_metadata() -> Response {
 
 // ---- Bearer-token gate for /mcp -----------------------------------------
 
-/// The verified principal of the authenticated MCP session, injected into request
-/// extensions so tools can attribute actions to it.
+/// The verified principal + session id of the authenticated MCP session,
+/// injected into request extensions so tools can attribute actions and bind
+/// per-session delegated identities.
 #[derive(Clone, Debug)]
-pub struct AuthedPrincipal(pub String);
+pub struct AuthedSession {
+    pub principal: String,
+    pub session_id: String,
+}
 
 pub async fn require_token(State(store): State<AuthStore>, mut request: Request<Body>, next: Next) -> Response {
     let token = request
@@ -383,14 +409,14 @@ pub async fn require_token(State(store): State<AuthStore>, mut request: Request<
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(str::to_owned);
 
-    let principal = match token {
-        Some(t) => store.principal_for_token(&t).await,
+    let session = match token {
+        Some(t) => store.session_for_token(&t).await,
         None => None,
     };
 
-    match principal {
-        Some(p) => {
-            request.extensions_mut().insert(AuthedPrincipal(p));
+    match session {
+        Some((principal, session_id)) => {
+            request.extensions_mut().insert(AuthedSession { principal, session_id });
             next.run(request).await
         }
         None => {

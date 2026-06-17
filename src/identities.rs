@@ -1,0 +1,318 @@
+//! Per-session delegated identities, obtained via Internet Identity's `/mcp`
+//! flow (II PR dfinity/internet-identity#4026).
+//!
+//! Model: the MCP server holds an Ed25519 **session key per authenticated MCP
+//! (OpenID) session**. To "sign in to a domain" the user is sent a short URL;
+//! it redirects their browser to II's `/mcp` with our session public key, II
+//! consent happens, and II form-POSTs a delegation chain back to our callback —
+//! a chain that ends at our session key and acts as the user's *default account
+//! for that app*. We then sign canister calls as that identity with `ic-agent`.
+//!
+//! Binding (so a delegation can only land in the session that requested it, and
+//! only via the same browser that authenticated that session):
+//!   * `link`  — in the short URL, bound to the requesting session.
+//!   * `GET /signin/<link>` requires the browser's `mcp_session` cookie to match
+//!     the link's session (blocks a victim opening someone else's link).
+//!   * a `SameSite=None` flow cookie set there is required on the cross-site
+//!     callback POST (blocks completing the flow in a different browser).
+//!   * `state` — single-use, routes the callback to the requesting session.
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use base64::Engine;
+use candid::Principal;
+use ic_agent::{
+    identity::{BasicIdentity, DelegatedIdentity, Delegation, SignedDelegation},
+    Identity,
+};
+use serde::Deserialize;
+use tokio::sync::RwLock;
+
+const II_MCP_URL_DEFAULT: &str = "https://uhh2r-oyaaa-aaaad-agbva-cai.icp0.io/mcp";
+const DEFAULT_TTL_MINUTES: u64 = 60;
+
+fn ii_mcp_url() -> String {
+    std::env::var("II_MCP_URL").unwrap_or_else(|_| II_MCP_URL_DEFAULT.to_string())
+}
+
+/// Where to send the browser after the callback so II's `/mcp` page shows the
+/// outcome (it owns the success/error UI).
+pub fn ii_status_url(success: bool) -> String {
+    format!("{}?status={}", ii_mcp_url(), if success { "success" } else { "error" })
+}
+fn public_url() -> String {
+    std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+fn now_ns() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+fn random_token() -> String {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).expect("getrandom");
+    hex::encode(b)
+}
+
+struct Session {
+    /// Ed25519 session-key seed; rebuild a `BasicIdentity` from it on demand.
+    key_seed: [u8; 32],
+    /// DER public key of the session key (sent to II as `publicKey`).
+    pubkey_der: Vec<u8>,
+    /// domain -> delegation acting as the user's account for that app.
+    delegations: HashMap<String, Stored>,
+}
+
+struct Stored {
+    user_key: Vec<u8>,
+    chain: Vec<SignedDelegation>,
+    expiration_ns: u64,
+    principal: String,
+}
+
+struct Link {
+    session_id: String,
+    domain: String,
+}
+
+struct PendingState {
+    session_id: String,
+    domain: String,
+    flow: String,
+}
+
+#[derive(Clone, Default)]
+pub struct Identities {
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    links: Arc<RwLock<HashMap<String, Link>>>,
+    states: Arc<RwLock<HashMap<String, PendingState>>>,
+}
+
+/// One row of `list_identities`.
+pub struct IdentityInfo {
+    pub name: String,
+    pub principal: String,
+    pub note: String,
+}
+
+impl Identities {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn ensure_session(&self, session_id: &str) {
+        let mut sessions = self.sessions.write().await;
+        sessions.entry(session_id.to_string()).or_insert_with(|| {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).expect("getrandom");
+            let pubkey_der = BasicIdentity::from_raw_key(&seed)
+                .public_key()
+                .expect("ed25519 public key");
+            Session {
+                key_seed: seed,
+                pubkey_der,
+                delegations: HashMap::new(),
+            }
+        });
+    }
+
+    /// Tool step: queue a sign-in and return the short URL the user must visit.
+    pub async fn start_sign_in(&self, session_id: &str, domain: &str) -> String {
+        self.ensure_session(session_id).await;
+        let link = random_token();
+        self.links.write().await.insert(
+            link.clone(),
+            Link {
+                session_id: session_id.to_string(),
+                domain: domain.to_string(),
+            },
+        );
+        format!("{}/signin/{}", public_url(), link)
+    }
+
+    /// `GET /signin/<link>`: verify the browser owns the link's session, then
+    /// produce the II redirect URL + the flow cookie value to set.
+    pub async fn begin_redirect(
+        &self,
+        link: &str,
+        browser_session_id: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let Link { session_id, domain } = self
+            .links
+            .write()
+            .await
+            .remove(link)
+            .ok_or("unknown or used sign-in link")?;
+
+        match browser_session_id {
+            Some(b) if b == session_id => {}
+            _ => return Err("this sign-in link belongs to a different session".into()),
+        }
+
+        let (pubkey_b64, _) = self.pubkey(&session_id).await.ok_or("no session key")?;
+        let state = random_token();
+        let flow = random_token();
+        self.states.write().await.insert(
+            state.clone(),
+            PendingState {
+                session_id,
+                domain: domain.clone(),
+                flow: flow.clone(),
+            },
+        );
+
+        let callback = format!("{}/signin/callback", public_url());
+        let url = format!(
+            "{ii}#publicKey={pk}&callback={cb}&state={st}&app={app}&ttl={ttl}",
+            ii = ii_mcp_url(),
+            pk = urlencoding::encode(&pubkey_b64),
+            cb = urlencoding::encode(&callback),
+            st = urlencoding::encode(&state),
+            app = urlencoding::encode(&domain),
+            ttl = DEFAULT_TTL_MINUTES,
+        );
+        Ok((url, flow))
+    }
+
+    /// `POST /signin/callback`: verify the flow cookie + state, store the
+    /// delegation under the requesting session/domain.
+    pub async fn complete_callback(
+        &self,
+        state: &str,
+        flow_cookie: Option<&str>,
+        delegation_json: &str,
+    ) -> Result<(), String> {
+        let pending = self
+            .states
+            .write()
+            .await
+            .remove(state)
+            .ok_or("unknown or used state")?;
+        match flow_cookie {
+            Some(f) if f == pending.flow => {}
+            _ => return Err("flow cookie missing or mismatched".into()),
+        }
+
+        let (user_key, chain, expiration_ns) = parse_delegation(delegation_json)?;
+        let principal = Principal::self_authenticating(&user_key).to_text();
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(&pending.session_id)
+            .ok_or("session vanished")?;
+        session.delegations.insert(
+            pending.domain,
+            Stored {
+                user_key,
+                chain,
+                expiration_ns,
+                principal,
+            },
+        );
+        Ok(())
+    }
+
+    async fn pubkey(&self, session_id: &str) -> Option<(String, Vec<u8>)> {
+        let sessions = self.sessions.read().await;
+        let s = sessions.get(session_id)?;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&s.pubkey_der);
+        Some((b64, s.pubkey_der.clone()))
+    }
+
+    /// `list_identities`: anonymous + every signed-in domain.
+    pub async fn list(&self, session_id: &str) -> Vec<IdentityInfo> {
+        let mut out = vec![IdentityInfo {
+            name: "anonymous".into(),
+            principal: Principal::anonymous().to_text(),
+            note: "unauthenticated calls".into(),
+        }];
+        if let Some(s) = self.sessions.read().await.get(session_id) {
+            let now = now_ns();
+            for (domain, d) in &s.delegations {
+                let mins_left = d.expiration_ns.saturating_sub(now) / 60_000_000_000;
+                out.push(IdentityInfo {
+                    name: domain.clone(),
+                    principal: d.principal.clone(),
+                    note: if d.expiration_ns <= now {
+                        "EXPIRED — sign in again".into()
+                    } else {
+                        format!("~{mins_left} min left")
+                    },
+                });
+            }
+        }
+        out
+    }
+
+    /// Build the `ic-agent` identity for a domain (None for anonymous handled by caller).
+    pub async fn delegated_identity(
+        &self,
+        session_id: &str,
+        domain: &str,
+    ) -> Result<DelegatedIdentity, String> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(session_id).ok_or("no such session")?;
+        let stored = session
+            .delegations
+            .get(domain)
+            .ok_or_else(|| format!("not signed in to '{domain}' — call sign_in first"))?;
+        if stored.expiration_ns <= now_ns() {
+            return Err(format!("delegation for '{domain}' expired — call sign_in again"));
+        }
+        let key = BasicIdentity::from_raw_key(&session.key_seed);
+        DelegatedIdentity::new(stored.user_key.clone(), Box::new(key), stored.chain.clone())
+            .map_err(|e| format!("invalid delegation chain: {e}"))
+    }
+}
+
+#[derive(Deserialize)]
+struct ChainJson {
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    delegations: Vec<SignedDelJson>,
+}
+#[derive(Deserialize)]
+struct SignedDelJson {
+    delegation: DelJson,
+    signature: String,
+}
+#[derive(Deserialize)]
+struct DelJson {
+    pubkey: String,
+    expiration: String,
+    #[serde(default)]
+    targets: Option<Vec<String>>,
+}
+
+/// Parse `DelegationChain.toJSON()` into (user_key DER, chain, max expiration ns).
+fn parse_delegation(json: &str) -> Result<(Vec<u8>, Vec<SignedDelegation>, u64), String> {
+    let chain: ChainJson = serde_json::from_str(json).map_err(|e| format!("bad delegation JSON: {e}"))?;
+    let user_key = hex::decode(&chain.public_key).map_err(|_| "bad publicKey hex")?;
+    let mut out = Vec::with_capacity(chain.delegations.len());
+    let mut max_exp = 0u64;
+    for d in chain.delegations {
+        let expiration = u64::from_str_radix(d.delegation.expiration.trim_start_matches("0x"), 16)
+            .map_err(|_| "bad expiration")?;
+        max_exp = max_exp.max(expiration);
+        let targets = match d.delegation.targets {
+            Some(ts) => Some(
+                ts.iter()
+                    .map(|t| hex::decode(t).map(|b| Principal::from_slice(&b)))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "bad target hex")?,
+            ),
+            None => None,
+        };
+        out.push(SignedDelegation {
+            delegation: Delegation {
+                pubkey: hex::decode(&d.delegation.pubkey).map_err(|_| "bad delegation pubkey hex")?,
+                expiration,
+                targets,
+            },
+            signature: hex::decode(&d.signature).map_err(|_| "bad delegation signature hex")?,
+        });
+    }
+    Ok((user_key, out, max_exp))
+}

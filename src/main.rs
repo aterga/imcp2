@@ -10,10 +10,13 @@
 mod auth;
 mod delegation;
 mod discover;
+mod identities;
 mod proposals;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
+use axum::response::IntoResponse;
+use identities::Identities;
 use proposals::Proposals;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -84,10 +87,18 @@ struct CallCanisterArgs {
     /// If true, perform a read-only `query` call; otherwise an `update` call.
     #[serde(default)]
     is_query: bool,
+    /// Which identity to call as: "anonymous" (default), or a domain you've
+    /// signed into (see list_identities / sign_in), e.g. "oisy.com".
+    #[serde(default = "default_identity")]
+    identity: String,
 }
 
 fn default_args() -> String {
     "()".to_string()
+}
+
+fn default_identity() -> String {
+    "anonymous".to_string()
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -116,19 +127,27 @@ struct DiscoverCanistersArgs {
     domain: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SignInArgs {
+    /// The app domain to sign into, e.g. "oisy.com".
+    domain: String,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
     proposals: Proposals,
+    identities: Identities,
     tool_router: ToolRouter<IcTools>,
 }
 
 #[tool_router]
 impl IcTools {
-    fn new(agent: Agent, proposals: Proposals) -> Self {
+    fn new(agent: Agent, proposals: Proposals, identities: Identities) -> Self {
         Self {
             agent,
             proposals,
+            identities,
             tool_router: Self::tool_router(),
         }
     }
@@ -160,7 +179,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister. Arguments are given in textual Candid syntax and the reply is returned as textual Candid. Set is_query=true for read-only query calls."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. `identity` selects who you call as: \"anonymous\" (default) or a domain you've signed into via sign_in (e.g. \"oisy.com\") — see list_identities. Set is_query=true for read-only query calls."
     )]
     async fn call_canister(
         &self,
@@ -169,14 +188,14 @@ impl IcTools {
             method,
             args,
             is_query,
+            identity,
         }): Parameters<CallCanisterArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = match Principal::from_text(&canister_id) {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-
-        // Textual Candid -> binary args.
         let arg_bytes = match candid_parser::parse_idl_args(&args) {
             Ok(parsed) => match parsed.to_bytes() {
                 Ok(b) => b,
@@ -185,30 +204,71 @@ impl IcTools {
             Err(e) => return Ok(err(format!("could not parse args `{args}`: {e}"))),
         };
 
-        // Call (anonymous).
-        let reply = if is_query {
-            self.agent
-                .query(&principal, &method)
-                .with_arg(arg_bytes)
-                .call()
-                .await
+        // Pick the agent: anonymous uses the shared agent; a domain identity
+        // builds an agent backed by that domain's delegation (the server signs
+        // as the user's account for that app).
+        let reply = if identity == "anonymous" {
+            raw_call(&self.agent, principal, &method, arg_bytes, is_query).await
         } else {
-            self.agent
-                .update(&principal, &method)
-                .with_arg(arg_bytes)
-                .call_and_wait()
-                .await
+            let session_id = match authed_session(&ctx) {
+                Some(s) => s.session_id,
+                None => return Ok(err("a domain identity needs an authenticated session".into())),
+            };
+            let delegated = match self.identities.delegated_identity(&session_id, &identity).await {
+                Ok(d) => d,
+                Err(e) => return Ok(err(e)),
+            };
+            let agent = match Agent::builder().with_url(IC_URL).with_identity(delegated).build() {
+                Ok(a) => a,
+                Err(e) => return Ok(err(format!("could not build agent: {e}"))),
+            };
+            raw_call(&agent, principal, &method, arg_bytes, is_query).await
         };
 
         let reply_bytes = match reply {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
-
-        // Decode the reply using the canister's Candid interface so record/variant
-        // field names are recovered (the wire format only carries field-name
-        // hashes; type-less decoding would show e.g. `25_979` instead of `name`).
+        // Decode against the canister's Candid interface so field names are recovered.
         Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
+    }
+
+    #[tool(description = "List the identities you can call as: \"anonymous\" plus every domain you've signed into (with its principal and remaining validity). Use sign_in to add one.")]
+    async fn list_identities(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_id = authed_session(&ctx).map(|s| s.session_id).unwrap_or_default();
+        let mut out = String::from("Identities (use as `identity` in call_canister):\n");
+        for i in self.identities.list(&session_id).await {
+            out.push_str(&format!("- {} — {} ({})\n", i.name, i.principal, i.note));
+        }
+        Ok(ok(out))
+    }
+
+    #[tool(description = "Sign in to a domain with Internet Identity so you can call canisters as the user's account for that app. Returns a short URL the USER must open in the same browser they signed into this MCP with. After they approve, that domain becomes available as an `identity` in call_canister. Use the same tool to re-sign-in when a delegation expires.")]
+    async fn sign_in(
+        &self,
+        Parameters(SignInArgs { domain }): Parameters<SignInArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Accept a bare host or a URL; normalise to the hostname.
+        let domain = domain.trim().trim_start_matches("https://").trim_start_matches("http://");
+        let domain = domain.split('/').next().unwrap_or(domain).to_string();
+        if domain.is_empty() {
+            return Ok(err("provide a domain, e.g. oisy.com".into()));
+        }
+        let session_id = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("sign_in needs an authenticated session".into())),
+        };
+        let url = self.identities.start_sign_in(&session_id, &domain).await;
+        Ok(ok(format!(
+            "To sign in to {domain}, ask the user to open this URL in the same browser they \
+             used to connect this MCP (it's bound to their session):\n{url}\n\
+             After they approve in Internet Identity, call list_identities to confirm, then \
+             use identity=\"{domain}\" in call_canister."
+        )))
     }
 
     #[tool(
@@ -368,13 +428,94 @@ fn decode_bytes_with_did(did: &str, method: &str, bytes: &[u8]) -> Option<String
     Some(decoded.to_string())
 }
 
-/// The verified II principal of the calling MCP session, if the request carried
-/// a valid bearer token (injected by [`auth::require_token`]).
-fn authed_principal(ctx: &RequestContext<RoleServer>) -> Option<String> {
+/// The authenticated MCP session (principal + session id) of the calling
+/// request, if it carried a valid bearer token (injected by [`auth::require_token`]).
+fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSession> {
     ctx.extensions
         .get::<axum::http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<auth::AuthedPrincipal>())
-        .map(|p| p.0.clone())
+        .and_then(|parts| parts.extensions.get::<auth::AuthedSession>())
+        .cloned()
+}
+
+fn authed_principal(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    authed_session(ctx).map(|s| s.principal)
+}
+
+fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_string())
+}
+
+/// GET /signin/{link} — verify the browser owns the link's session, set a flow
+/// cookie, and redirect to II's /mcp delegation flow.
+async fn signin_redirect(
+    axum::extract::State(identities): axum::extract::State<Identities>,
+    axum::extract::Path(link): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let browser_session = cookie_value(&headers, "mcp_session");
+    match identities.begin_redirect(&link, browser_session.as_deref()).await {
+        Ok((url, flow)) => {
+            let cookie = format!(
+                "mcp_flow={flow}; Path=/signin; HttpOnly; Secure; SameSite=None; Max-Age=600"
+            );
+            (
+                axum::http::StatusCode::SEE_OTHER,
+                [
+                    (axum::http::header::LOCATION, url),
+                    (axum::http::header::SET_COOKIE, cookie),
+                ],
+            )
+                .into_response()
+        }
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CallbackForm {
+    delegation: String,
+    state: String,
+}
+
+/// POST /signin/callback — II form-POSTs the delegation here; verify flow cookie
+/// + state, store the delegation, then send the browser back to II with a status.
+async fn signin_callback(
+    axum::extract::State(identities): axum::extract::State<Identities>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Form(form): axum::extract::Form<CallbackForm>,
+) -> axum::response::Response {
+    let flow = cookie_value(&headers, "mcp_flow");
+    let ok = identities
+        .complete_callback(&form.state, flow.as_deref(), &form.delegation)
+        .await;
+    let status_url = identities::ii_status_url(ok.is_ok());
+    if let Err(e) = ok {
+        tracing::warn!("sign-in callback rejected: {e}");
+    }
+    (
+        axum::http::StatusCode::SEE_OTHER,
+        [(axum::http::header::LOCATION, status_url)],
+    )
+        .into_response()
+}
+
+/// Perform a query or update call and return the raw Candid reply bytes.
+async fn raw_call(
+    agent: &Agent,
+    canister: Principal,
+    method: &str,
+    arg: Vec<u8>,
+    is_query: bool,
+) -> Result<Vec<u8>, ic_agent::AgentError> {
+    if is_query {
+        agent.query(&canister, method).with_arg(arg).call().await
+    } else {
+        agent.update(&canister, method).with_arg(arg).call_and_wait().await
+    }
 }
 
 #[tool_handler]
@@ -391,10 +532,12 @@ impl ServerHandler for IcTools {
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
              `discover_canisters` to find the canister(s) behind it (frontend via header, \
-             backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface; `call_canister` calls \
-             a method anonymously with textual Candid in and out; `propose_call` queues ANY \
-             canister call for the user to review and sign with their Internet Identity (the \
-             server never signs); `check_proposal` reports the signed call's outcome."
+             backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface. \
+             `call_canister` calls a method with textual Candid in/out, AS an `identity`: \
+             \"anonymous\" by default, or a domain the user has signed into. Use \
+             `list_identities` to see available identities, and `sign_in(domain)` to add one — \
+             it returns a short URL the user opens to authorize via Internet Identity, after \
+             which you can call as that domain (e.g. identity=\"oisy.com\")."
                 .to_string(),
         )
     }
@@ -471,13 +614,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("built ic-agent against {IC_URL}");
 
     let proposals = Proposals::default();
+    let identities = Identities::new();
 
     let ct = tokio_util::sync::CancellationToken::new();
     let mcp = {
         let agent = agent.clone();
         let proposals = proposals.clone();
+        let identities = identities.clone();
         StreamableHttpService::new(
-            move || Ok(IcTools::new(agent.clone(), proposals.clone())),
+            move || Ok(IcTools::new(agent.clone(), proposals.clone(), identities.clone())),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
                 .with_cancellation_token(ct.child_token())
@@ -486,6 +631,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let store = auth::AuthStore::new();
+
+    // Browser-facing domain sign-in endpoints (II /mcp delegation round-trip).
+    let signin = axum::Router::new()
+        .route("/signin/{link}", axum::routing::get(signin_redirect))
+        .route("/signin/callback", axum::routing::post(signin_callback))
+        .with_state(identities.clone());
 
     // Browser-facing proposal API used by /app (signer reviews & reports outcome).
     let api = axum::Router::new()
@@ -532,6 +683,7 @@ async fn main() -> anyhow::Result<()> {
         // Browser-side Candid codec (Rust compiled to WASM) served for /app.
         .nest_service("/wasm", tower_http::services::ServeDir::new("static/wasm"))
         .merge(api)
+        .merge(signin)
         .merge(oauth)
         .merge(protected_mcp);
 
