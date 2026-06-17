@@ -40,8 +40,12 @@ use tokio::sync::RwLock;
 
 /// Single Internet Identity instance used by BOTH the connector sign-in
 /// (`authorize.html`) and the app delegation flow. Override with `II_URL`.
-/// Default: II **staging-B** (frontend canister `uhh2r-oyaaa-aaaad-agbva-cai`).
-const II_URL_DEFAULT: &str = "https://uhh2r-oyaaa-aaaad-agbva-cai.icp0.io";
+/// Default: **`beta.id.ai`** (II Staging A, canister `gjxif-ryaaa-aaaad-ae4ka-cai`),
+/// the instance that serves the `*.beta.id.ai` domains. A real domain is required
+/// here: the raw `<canister>.icp0.io` origin is rate-limited (HTTP 429) for the
+/// browser login SPA, which leaves the II popup blank. NOTE: the `/mcp` delegation
+/// endpoint may not yet be enabled on this instance — domain sign-in depends on it.
+const II_URL_DEFAULT: &str = "https://beta.id.ai";
 const DEFAULT_TTL_MINUTES: u64 = 60;
 /// How long a staged-but-unconfirmed delegation lives before it's discarded.
 const PENDING_TTL_NS: u64 = 10 * 60 * 1_000_000_000;
