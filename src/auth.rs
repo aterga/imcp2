@@ -83,9 +83,10 @@ impl AuthStore {
     /// any client_id (rather than requiring it to be pre-registered) keeps the
     /// flow working across server restarts, where Claude Code reuses a cached
     /// dynamically-registered client_id against the in-memory store. The
-    /// redirect_uri is still restricted to loopback to avoid an open redirector.
+    /// redirect_uri is still restricted to loopback plus ChatGPT connector OAuth
+    /// callbacks to avoid an open redirector.
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        if !is_loopback_redirect(redirect_uri) {
+        if !is_allowed_redirect(redirect_uri) {
             return false;
         }
         self.clients
@@ -310,12 +311,14 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     Json(body).into_response()
 }
 
-/// Loopback redirect targets only — accept any port (OAuth clients like Claude
-/// Code pick an ephemeral localhost callback port), reject non-local hosts.
-fn is_loopback_redirect(redirect_uri: &str) -> bool {
+/// Allowed redirect targets: loopback (accept any port — OAuth clients like
+/// Claude Code pick an ephemeral localhost callback port) plus ChatGPT's
+/// connector OAuth callbacks. Reject anything else to avoid an open redirector.
+fn is_allowed_redirect(redirect_uri: &str) -> bool {
     redirect_uri.starts_with("http://localhost")
         || redirect_uri.starts_with("http://127.0.0.1")
         || redirect_uri.starts_with("http://[::1]")
+        || redirect_uri.starts_with("https://chatgpt.com/connector/oauth/")
 }
 
 fn pkce_s256(verifier: &str) -> String {
