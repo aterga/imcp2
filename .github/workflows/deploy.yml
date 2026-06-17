@@ -53,7 +53,15 @@ jobs:
           if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
-            ssh-keyscan -H "${HOST##*@}" > ~/.ssh/known_hosts 2>/dev/null
+            # Trust-on-first-use: no pinned key, so we accept whatever the host
+            # presents now. This is susceptible to MITM / DNS hijack — set the
+            # DEPLOY_KNOWN_HOSTS secret (output of `ssh-keyscan <host>`) to pin it.
+            echo "::warning::DEPLOY_KNOWN_HOSTS not set; trusting host key on first use (ssh-keyscan). Set DEPLOY_KNOWN_HOSTS to pin it."
+            ssh-keyscan -T 20 -H "${HOST##*@}" > ~/.ssh/known_hosts 2>/dev/null || true
+            if [ ! -s ~/.ssh/known_hosts ]; then
+              echo "::error::ssh-keyscan captured no host keys for ${HOST##*@}; aborting." >&2
+              exit 1
+            fi
           fi
           chmod 644 ~/.ssh/known_hosts
 
