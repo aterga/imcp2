@@ -133,6 +133,14 @@ struct SignInArgs {
     domain: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema, Default)]
+struct ListIdentitiesArgs {
+    /// Optional: after starting a sign_in, pass that domain here to WAIT (up to
+    /// ~55s) for the user to finish, instead of returning immediately.
+    #[serde(default)]
+    wait_for: Option<String>,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
@@ -233,15 +241,32 @@ impl IcTools {
         Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
     }
 
-    #[tool(description = "List the identities you can call as: \"anonymous\" plus every domain you've signed into (with its principal and remaining validity). Use sign_in to add one.")]
+    #[tool(description = "List the identities you can call as: \"anonymous\" plus every domain you've signed into (principal + remaining validity). After a sign_in, call this with wait_for=<domain> — it waits (~55s) for the user to finish so you can confirm yourself instead of asking them; if it returns still-pending, call again.")]
     async fn list_identities(
         &self,
+        Parameters(ListIdentitiesArgs { wait_for }): Parameters<ListIdentitiesArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = authed_session(&ctx).map(|s| s.session_id).unwrap_or_default();
+        let mut pending_note = None;
+        if let Some(domain) = wait_for.as_deref() {
+            let landed = self
+                .identities
+                .wait_for_delegation(&session_id, domain, std::time::Duration::from_secs(55))
+                .await;
+            if !landed {
+                pending_note = Some(format!(
+                    "\nStill waiting for the user to finish signing in to {domain}. \
+                     If they have, call list_identities again with wait_for=\"{domain}\"."
+                ));
+            }
+        }
         let mut out = String::from("Identities (use as `identity` in call_canister):\n");
         for i in self.identities.list(&session_id).await {
             out.push_str(&format!("- {} — {} ({})\n", i.name, i.principal, i.note));
+        }
+        if let Some(n) = pending_note {
+            out.push_str(&n);
         }
         Ok(ok(out))
     }
@@ -264,10 +289,11 @@ impl IcTools {
         };
         let url = self.identities.start_sign_in(&session_id, &domain).await;
         Ok(ok(format!(
-            "To sign in to {domain}, ask the user to open this URL in the same browser they \
-             used to connect this MCP (it's bound to their session):\n{url}\n\
-             After they approve in Internet Identity, call list_identities to confirm, then \
-             use identity=\"{domain}\" in call_canister."
+            "Ask the user to open this URL in the same browser they used to connect this MCP \
+             (it's bound to their session):\n{url}\n\
+             Then immediately call list_identities with wait_for=\"{domain}\" — it blocks until \
+             they finish, so you confirm it yourself. Do NOT ask the user to tell you when \
+             they're done. Once {domain} appears, call_canister with identity=\"{domain}\"."
         )))
     }
 

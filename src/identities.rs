@@ -42,7 +42,8 @@ fn ii_mcp_url() -> String {
 /// Where to send the browser after the callback so II's `/mcp` page shows the
 /// outcome (it owns the success/error UI).
 pub fn ii_status_url(success: bool) -> String {
-    format!("{}?status={}", ii_mcp_url(), if success { "success" } else { "error" })
+    // II reads `status` from the URL fragment, like the request params.
+    format!("{}#status={}", ii_mcp_url(), if success { "success" } else { "error" })
 }
 fn public_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
@@ -165,7 +166,7 @@ impl Identities {
 
         let callback = format!("{}/signin/callback", public_url());
         let url = format!(
-            "{ii}#publicKey={pk}&callback={cb}&state={st}&app={app}&ttl={ttl}",
+            "{ii}#public_key={pk}&callback={cb}&state={st}&app={app}&ttl={ttl}",
             ii = ii_mcp_url(),
             pk = urlencoding::encode(&pubkey_b64),
             cb = urlencoding::encode(&callback),
@@ -219,6 +220,30 @@ impl Identities {
         let s = sessions.get(session_id)?;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&s.pubkey_der);
         Some((b64, s.pubkey_der.clone()))
+    }
+
+    /// Wait (bounded) until `domain` has a live delegation for the session, so a
+    /// caller can sign in and then confirm in one step instead of polling. Returns
+    /// true if it landed, false on timeout.
+    pub async fn wait_for_delegation(
+        &self,
+        session_id: &str,
+        domain: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let steps = (timeout.as_millis() / 500).max(1);
+        for _ in 0..steps {
+            {
+                let sessions = self.sessions.read().await;
+                if let Some(s) = sessions.get(session_id) {
+                    if s.delegations.get(domain).is_some_and(|d| d.expiration_ns > now_ns()) {
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        false
     }
 
     /// `list_identities`: anonymous + every signed-in domain.
