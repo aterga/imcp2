@@ -107,6 +107,15 @@ Configure these repository secrets (**Settings → Secrets and variables → Act
 The host prerequisites above (DNS, inbound 80/443, sudo SSH user) still apply — the
 workflow only automates the build-and-ship step, not provisioning the box.
 
+### Approval gate
+
+The deploy job runs in the GitHub **`production` environment**. To require a manual
+approval before each deploy, go to **Settings → Environments → production** and add
+yourself (or a team) as a **Required reviewer**. Until a reviewer is configured the
+environment imposes no gate, so the deploy still runs automatically on push to `main`.
+You can also scope the environment's secrets/branches there if you'd rather not keep
+`DEPLOY_*` as repo-wide secrets.
+
 ## Operating
 
 ```sh
