@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euxo pipefail
+
+# --- swap: a t4g.nano has only 0.5 GB RAM; 1 GB swap is cheap OOM insurance ---
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=1024
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# --- docker ---
+dnf install -y docker
+systemctl enable --now docker
+
+%{ if ghcr_token != "" ~}
+# --- private GHCR pull ---
+echo "${ghcr_token}" | docker login ghcr.io -u "${ghcr_user}" --password-stdin
+%{ endif ~}
+
+# --- the app: listens on $PORT, bound to host network; SG keeps 8000 private ---
+docker rm -f mcp 2>/dev/null || true
+docker run -d --name mcp --restart always --network host \
+  -e PORT=8000 \
+  -e PUBLIC_URL="https://${domain}" \
+  -e RUST_LOG=info \
+  "${image}"
+
+# --- Caddy: automatic Let's Encrypt TLS, reverse-proxy to the app ---
+mkdir -p /etc/caddy /var/lib/caddy
+cat > /etc/caddy/Caddyfile <<'CADDY'
+%{ if acme_email != "" ~}
+{
+  email ${acme_email}
+}
+%{ endif ~}
+${domain} {
+  reverse_proxy 127.0.0.1:8000
+}
+CADDY
+
+docker rm -f caddy 2>/dev/null || true
+docker run -d --name caddy --restart always --network host \
+  -v /etc/caddy/Caddyfile:/etc/caddy/Caddyfile:ro \
+  -v /var/lib/caddy:/data \
+  caddy:2

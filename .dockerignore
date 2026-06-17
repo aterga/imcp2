@@ -1,4 +1,3 @@
-target
+/target
+candid-wasm/target
 .git
-**/*.md
-Cargo.lock

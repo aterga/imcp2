@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and edit. Everything has a default; nothing is required.
+
+region = "us-east-1"
+
+# Leave `domain` unset to auto-use a free <ip>.sslip.io hostname (no DNS setup).
+# Set it only if you want a stable name you control (then add an A record after apply):
+# domain = "mcp.example.com"
+
+# acme_email = "you@example.com"            # optional, for Let's Encrypt expiry notices
+# image = "ghcr.io/aterga/imcp2:latest"   # default; override to pin a :sha- tag
+# instance_type = "t4g.micro"               # default (1 GB); drop to t4g.nano to save ~$3/mo
+
+# Only if you kept the GHCR package private:
+# ghcr_user  = "aterga"
+# ghcr_token = "ghp_xxx"   # better: pass via TF_VAR_ghcr_token env var, not the file

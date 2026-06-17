@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Authorize MCP client — Internet Identity</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; text-align: center; }
+  button { font: inherit; padding: .6rem 1.1rem; border-radius: .4rem; border: 1px solid #888; background: #f4f4f5; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  code { background: #f4f4f5; padding: 0 .2rem; border-radius: .2rem; word-break: break-all; }
+  .muted { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Authorize access</h1>
+<p class="muted">
+  Client <code id="client"></code> is requesting access to the MCP server.
+  Sign in with Internet Identity to approve — your principal becomes the
+  authenticated subject of the access token.
+</p>
+
+<p><button id="login">Sign in with Internet Identity</button></p>
+<p id="status" class="muted"></p>
+
+<script type="module">
+import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2.4.1?deps=@dfinity/agent@2.4.1,@dfinity/candid@2.4.1,@dfinity/principal@2.4.1,@dfinity/identity@2.4.1";
+
+const II_URL = "https://id.ai";
+const params = new URLSearchParams(location.search);
+const $ = (id) => document.getElementById(id);
+$("client").textContent = params.get("client_id") ?? "(unknown)";
+
+const authClient = await AuthClient.create();
+
+$("login").onclick = async () => {
+  $("login").disabled = true;
+  $("status").textContent = "opening Internet Identity…";
+  await authClient.login({
+    identityProvider: II_URL,
+    maxTimeToLive: BigInt(8) * BigInt(3_600_000_000_000),
+    onError: (e) => {
+      $("login").disabled = false;
+      $("status").textContent = "login error: " + e;
+    },
+    onSuccess: proveAndRedirect,
+  });
+};
+
+// Prove control of the principal: fetch a server nonce, sign it with the
+// delegation identity, and POST the nonce signature + delegation chain. The
+// server verifies the chain before issuing a principal-bound auth code.
+async function proveAndRedirect() {
+  const identity = authClient.getIdentity();
+  const principal = identity.getPrincipal().toText();
+  $("status").textContent = "signed in as " + principal + " — proving identity…";
+  try {
+    const { nonce } = await (await fetch("/oauth/nonce")).json();
+    const sig = await identity.sign(new TextEncoder().encode(nonce));
+    const chain = identity.getDelegation().toJSON(); // { publicKey, delegations: [...] }
+
+    const resp = await fetch("/oauth/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: params.get("client_id"),
+        redirect_uri: params.get("redirect_uri"),
+        scope: params.get("scope") ?? "",
+        state: params.get("state") ?? "",
+        code_challenge: params.get("code_challenge"),
+        nonce,
+        pubkey: chain.publicKey,
+        delegations: chain.delegations,
+        signature: toHex(sig),
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error_description ?? data.error ?? "approve failed");
+    window.location = data.redirect;
+  } catch (e) {
+    $("login").disabled = false;
+    $("status").textContent = "error: " + (e?.message ?? e);
+  }
+}
+
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+</script>
+</body>
+</html>

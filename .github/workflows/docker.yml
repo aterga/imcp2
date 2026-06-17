@@ -1,17 +1,22 @@
-name: Build and push image
+name: Build and push arm64 image
+
+# Builds a linux/arm64 image so it runs on AWS Graviton (t4g.*) instances.
+# Uses a native arm64 runner (free for public repos) to avoid slow QEMU builds.
 
 on:
   push:
     branches: ["**"]
     tags: ["v*"]
+    # Don't rebuild the image for infra/docs-only changes.
+    paths-ignore: ["deploy/**", "**.md"]
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/icp-mcp-server
+  IMAGE: ghcr.io/${{ github.repository_owner }}/imcp2
 
 jobs:
   build-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
@@ -44,7 +49,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

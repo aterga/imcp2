@@ -1,25 +1,22 @@
-# syntax=docker/dockerfile:1
+# Multi-stage build for the MCP server. The WASM Candid codec under static/wasm
+# is prebuilt and committed, so no wasm toolchain is needed here.
+FROM rust:1-slim-bookworm AS build
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# static/ is needed at build time too: main.rs/auth.rs include_str! the HTML pages.
+COPY static ./static
+RUN cargo build --release
 
-# ---- Build stage ----
-FROM rust:1-bookworm AS builder
-
-WORKDIR /build
-
-# Copy the whole workspace so the workspace Cargo.toml resolves the member.
-COPY Cargo.toml ./
-COPY tools/icp-mcp-server ./tools/icp-mcp-server
-
-RUN cargo build --release -p icp-mcp-server
-
-# ---- Runtime stage ----
 FROM debian:bookworm-slim
-
-# ic-agent talks to IC mainnet over HTTPS, so TLS roots are required.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+WORKDIR /app
+# ca-certificates: TLS to the IC boundary node (icp-api.io) via rustls' platform verifier.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /build/target/release/icp-mcp-server /usr/local/bin/icp-mcp-server
-
-# The server speaks MCP over stdio.
-ENTRYPOINT ["/usr/local/bin/icp-mcp-server"]
+COPY --from=build /app/target/release/mcp-poc /usr/local/bin/mcp-poc
+# Static assets (signing frontend + WASM codec) are served relative to the workdir.
+COPY static ./static
+ENV RUST_LOG=info
+# PaaS injects $PORT; the server honours it (default 8000). PUBLIC_URL must be set
+# to the deployment's public https URL so OAuth discovery + the /app link are correct.
+CMD ["mcp-poc"]
