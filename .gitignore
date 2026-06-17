@@ -1,3 +1,6 @@
 /target
 .claude/
 candid-wasm/target
+
+# native deploy build artifact
+/build-out
