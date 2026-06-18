@@ -310,7 +310,7 @@ impl Identities {
             .map_err(|e| format!("could not build II agent: {e}"))?;
 
         // mcp_prepare_account_delegation(target_origin, session_key, opt max_ttl_ns)
-        //   -> record { user_key: blob; expiration: nat64 }
+        //   -> variant { Ok: record { user_key: blob; expiration: nat64 }; Err: AccountDelegationError }
         let prepare_arg = Encode!(
             &origin,
             &session_key_der,
@@ -323,11 +323,12 @@ impl Identities {
             .call_and_wait()
             .await
             .map_err(|e| format!("mcp_prepare_account_delegation failed: {e}"))?;
-        let prepared = Decode!(&prepared, PreparedDelegation)
-            .map_err(|e| format!("could not decode prepare reply: {e}"))?;
+        let prepared = Decode!(&prepared, PrepareReply)
+            .map_err(|e| format!("could not decode prepare reply: {e}"))?
+            .map_err(|e| format!("II refused mcp_prepare_account_delegation: {e:?}"))?;
 
         // mcp_get_account_delegation(target_origin, session_key, expiration)
-        //   -> variant { Ok: SignedDelegation; Err: text }
+        //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError }
         let get_arg = Encode!(&origin, &session_key_der, &prepared.expiration)
             .map_err(|e| format!("could not encode get args: {e}"))?;
         let got = agent
@@ -336,14 +337,9 @@ impl Identities {
             .call()
             .await
             .map_err(|e| format!("mcp_get_account_delegation failed: {e}"))?;
-        let got = Decode!(&got, GetDelegationResult)
-            .map_err(|e| format!("could not decode get reply: {e}"))?;
-        let signed = match got {
-            GetDelegationResult::Ok(d) => d,
-            GetDelegationResult::Err(e) => {
-                return Err(format!("II refused account delegation: {e}"))
-            }
-        };
+        let signed = Decode!(&got, GetReply)
+            .map_err(|e| format!("could not decode get reply: {e}"))?
+            .map_err(|e| format!("II refused account delegation: {e:?}"))?;
 
         let chain = vec![signed.into_agent(&session_key_der)?];
         Ok(AppDelegation {
@@ -440,14 +436,28 @@ fn parse_chain_json(json: &str) -> Result<ParsedChain, String> {
     })
 }
 
-// ---- II candid contract (NOT yet deployed; built against this contract) ----
+// ---- II candid contract for the mcp_*_account_delegation methods ----
 
-/// Reply of `mcp_prepare_account_delegation`.
+/// `Ok` payload of `mcp_prepare_account_delegation` (II `PrepareAccountDelegation`).
 #[derive(CandidType, Deserialize)]
 struct PreparedDelegation {
     user_key: Vec<u8>,
     expiration: u64,
 }
+
+/// II's `AccountDelegationError` — the `Err` arm of both methods. We only need
+/// to decode and display it.
+#[derive(CandidType, Deserialize, Debug)]
+enum AccountDelegationError {
+    InternalCanisterError(String),
+    Unauthorized(Principal),
+    NoSuchDelegation,
+}
+
+// Both methods return `variant { Ok; Err }`, i.e. a Rust `Result`. Aliased so the
+// `Decode!` macro doesn't choke on the comma inside the generic.
+type PrepareReply = std::result::Result<PreparedDelegation, AccountDelegationError>;
+type GetReply = std::result::Result<IiSignedDelegation, AccountDelegationError>;
 
 /// One delegation as returned by II's `mcp_get_account_delegation`.
 #[derive(CandidType, Deserialize)]
@@ -483,13 +493,6 @@ impl IiSignedDelegation {
             signature: self.signature,
         })
     }
-}
-
-/// Result of `mcp_get_account_delegation : variant { Ok: SignedDelegation; Err: text }`.
-#[derive(CandidType, Deserialize)]
-enum GetDelegationResult {
-    Ok(IiSignedDelegation),
-    Err(String),
 }
 
 #[cfg(test)]
