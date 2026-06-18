@@ -732,17 +732,18 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(auth::protected_resource_metadata),
         )
-        // Path-aware discovery locations (RFC 9728 §3.1 / RFC 8414): a resource at
-        // `…/mcp` has its metadata at `/.well-known/<doc>/mcp`. Clients vary —
-        // Claude/ChatGPT follow the `resource_metadata` hint (the root doc above),
-        // but spec-strict clients derive the `/mcp`-suffixed URL. Serve both.
+        // Path-aware protected-resource metadata (RFC 9728 §3.1): the resource
+        // `…/mcp` has a path, so its metadata canonically lives at
+        // `/.well-known/oauth-protected-resource/mcp`. Clients that follow the
+        // `resource_metadata` hint use the root doc above; spec-strict clients
+        // derive this `/mcp`-suffixed URL. We deliberately do NOT add a
+        // `/mcp`-suffixed *authorization-server* doc: our AS issuer is `base_url()`
+        // (no path), so per RFC 8414 a strict client requesting the suffixed AS
+        // doc would reject it on issuer mismatch — the AS is correctly discovered
+        // at the root via `authorization_servers` in the protected-resource doc.
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             axum::routing::get(auth::protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server/mcp",
-            axum::routing::get(auth::authorization_server_metadata),
         )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
         .route("/oauth/nonce", axum::routing::get(auth::nonce))
@@ -777,9 +778,24 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_bytes_with_did;
+    use super::{decode_bytes_with_did, sanitize_path};
     use candid::types::value::IDLArgs;
     use candid_parser::parse_idl_args;
+
+    // The single-use /signin/<link> token must be redacted from request logs,
+    // while the fixed sub-paths and all other routes log verbatim.
+    #[test]
+    fn sanitize_path_redacts_signin_link_only() {
+        assert_eq!(sanitize_path("/signin/abc123deadbeef"), "/signin/<redacted>");
+        // Fixed sub-paths carry no path secret and are kept.
+        assert_eq!(sanitize_path("/signin/callback"), "/signin/callback");
+        assert_eq!(sanitize_path("/signin/confirm"), "/signin/confirm");
+        // Unrelated routes are untouched.
+        assert_eq!(sanitize_path("/mcp"), "/mcp");
+        assert_eq!(sanitize_path("/oauth/token"), "/oauth/token");
+        assert_eq!(sanitize_path("/signin"), "/signin");
+        assert_eq!(sanitize_path("/"), "/");
+    }
 
     // Field names are hashed on the Candid wire; decoding against the method's
     // declared return type must recover them (type-less decoding shows hashes).
