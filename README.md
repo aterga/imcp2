@@ -35,9 +35,10 @@ Add the server to Claude Code (replace the URL with wherever it's hosted):
 claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 ```
 
-Then run `/mcp` → **ic-poc** → authenticate: a browser opens the authorize page,
-you sign in with **Internet Identity (id.ai)**, and the three tools become
-available. (Any MCP client with remote HTTP + OAuth support works.)
+Then run `/mcp` → **ic-poc** → authenticate: the browser is sent to **Internet
+Identity**'s `/mcp` flow, you sign in once, and the three tools become available
+— that single login is the connection's standing credential. (Any MCP client
+with remote HTTP + OAuth support works.)
 
 ## Run
 
@@ -87,40 +88,46 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 ## Auth (OAuth 2.1, login via Internet Identity)
 
 `/mcp` is gated by a bearer token. The MCP client obtains it with a standard
-OAuth 2.1 authorization-code flow — except the authorize page logs the user in
-with **Internet Identity (id.ai)** via `@dfinity/auth-client` instead of
-username/password, and the issued token is bound to the resulting **principal**.
+OAuth 2.1 authorization-code flow, except logging in runs **Internet Identity's
+`/mcp` delegation flow** instead of username/password, and the issued token is
+bound to the resulting **principal**.
 
 Endpoints:
 
 - `GET /.well-known/oauth-authorization-server` — AS metadata
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
 - `POST /oauth/register` — dynamic client registration
-- `GET  /oauth/authorize` — serves the id.ai login page
-- `POST /oauth/approve` — called after II login; mints a principal-bound code
+- `GET  /oauth/authorize` — mints the connection's backend key and redirects the
+  browser to II's `/mcp` flow, sending the backend **public** key
+- `POST /oauth/connect/callback` — II form-POSTs the delegation chain here; the
+  server verifies + stores it and redirects back with a principal-bound code
 - `POST /oauth/token` — exchanges the code for an access token
 
 Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
 pointing at the resource metadata, as the MCP spec expects.
 
-**The principal is verified, not asserted.** After id.ai login the browser signs
-a server-issued nonce (`GET /oauth/nonce`) with its delegation identity and
-sends the delegation chain. The server (`src/delegation.rs`) verifies:
+**No private key is ever transmitted.** The backend generates a per-connection
+Ed25519 key and sends only its **public** key to II. II logs the user in and
+returns a delegation chain `anchor → backend key` (the 60-minute standing
+credential). The chain itself is the proof of identity, so there is no nonce
+round-trip; the server (`src/delegation.rs`) verifies:
 
-1. the chain links the session key to the II root (the II canister signature is
-   checked against the IC mainnet root key via `ic-signature-verification`);
-2. the leaf session key's signature over the nonce (Ed25519 or P-256);
-3. the principal is `self_authenticating(root_pubkey)`;
-4. no delegation has expired.
+1. the chain links to the II root (the II canister signature is checked against
+   the IC mainnet root key via `ic-signature-verification`);
+2. no delegation has expired;
+3. the chain ends at this connection's backend key (so the backend, holding the
+   private half, can sign with it);
+4. the principal is `self_authenticating(user_key)`.
 
 Only then is a principal-bound code minted. This matters because the server
 keys per-principal session data off that identity — a spoofable principal would
 let one user read another's session. (Fund safety is independent: that's
 enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
-codes live 120s, nonces 300s, access tokens 1h.
+codes live 120s, connects 600s, access tokens 1h.
 
-Set the public base URL (used in the discovery docs) with `PUBLIC_URL`; point
-the connector login at an II instance with `II_URL` (defaults to `beta.id.ai`).
+Set the public base URL (used in the discovery docs and as the MCP origin) with
+`PUBLIC_URL`; point everything at a single Internet Identity instance with
+`II_URL` (defaults to `beta.id.ai`).
 
 ## Domain identities (on demand)
 
@@ -152,30 +159,30 @@ mcp_get_account_delegation :
 
 - `target_origin` is `https://<domain>`, with IC gateway domains remapped:
   `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
-- The II canister is configured with `II_CANISTER_ID` (defaults to the II
-  staging-B frontend canister `uhh2r-oyaaa-aaaad-agbva-cai`), called over
+- These methods live on the **same II instance** as the connect-time login: the
+  canister id is resolved from `II_URL` — from its host label for a
+  `<canister>.icp0.io` URL, or from the gateway's `x-ic-canister-id` header for a
+  custom domain like `beta.id.ai` (override with `II_CANISTER_ID`). Calls go over
   `https://icp-api.io`.
 - Derived delegations are cached per `(session, domain)` and reused until they
   near expiry, then re-derived.
 
-> **Status:** the II canister methods above are **not deployed yet**, and the
-> connect-time flow that mints the 60-minute standing credential is **not landed
-> yet**. The acquisition of the standing credential is stubbed behind a single
-> clearly-`TODO`'d function (`Identities::standing_identity`) that returns an
-> explanatory error; once the II side lands it returns the real
-> `DelegatedIdentity`. Everything compiles; the live II round-trip can't be
-> exercised until then.
+> **Status:** the standing-credential connect flow is implemented against II's
+> existing `/mcp` delegation flow, so it works today. The two `mcp_*_account_delegation`
+> canister methods used for on-demand app delegations are **not deployed yet** —
+> the server is built against their candid contract, so that round-trip can't be
+> exercised until the II side lands and is deployed to the configured `II_URL`.
 
 ## Roadmap
 
 - [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
       reference resources.
-- [x] OpenID/OAuth auth (authorize page logs in via `@dfinity/auth-client`
-      against **id.ai**); verified II delegation; PKCE; expiring tokens.
+- [x] OpenID/OAuth auth: connecting runs II's `/mcp` delegation flow (backend
+      public key out, delegation in); verified II delegation; PKCE; expiring tokens.
 - [x] On-demand **domain identities**: a 60-min standing II delegation per
       connection mints ≤5-min per-app account delegations directly via II canister
       methods (`call_canister` `identity`); no per-app browser flow.
-- [ ] Land the II connect-time standing-credential flow + deploy the
-      `mcp_*_account_delegation` canister methods (currently stubbed/contract-only).
+- [ ] Deploy the `mcp_*_account_delegation` canister methods (server is built
+      against their candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.

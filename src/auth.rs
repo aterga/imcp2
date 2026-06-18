@@ -1,17 +1,19 @@
-//! OAuth 2.1 authorization server for the MCP endpoint, with **Internet Identity
-//! (id.ai)** as the login mechanism. The authorize page logs the user in with
-//! `@dfinity/auth-client`; the browser then proves control of its principal by
-//! signing a server-issued nonce with the delegation identity. The server
-//! verifies the delegation chain (see [`crate::delegation`]) before minting a
-//! principal-bound authorization code.
+//! OAuth 2.1 authorization server for the MCP endpoint, with **Internet Identity**
+//! as the login mechanism. Connecting runs II's `/mcp` delegation flow: the
+//! authorize endpoint sends the browser to II with this connection's backend
+//! **public** key, and II form-POSTs back a delegation chain `anchor -> backend
+//! key` (the 60-minute standing credential). The server verifies the chain (see
+//! [`crate::delegation`]) — the chain itself is the proof of identity — stores
+//! it, and mints a principal-bound authorization code. No private key is ever
+//! transmitted.
 //!
 //! Implemented: dynamic client registration, PKCE (S256, enforced), short-lived
-//! codes/nonces, 1h access tokens, verified principal binding.
+//! codes, 1h access tokens, verified principal binding.
 
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -19,7 +21,7 @@ use axum::{
     extract::{Query, State},
     http::{Request, StatusCode},
     middleware::Next,
-    response::{Html, IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     Form,
 };
 use base64::Engine;
@@ -30,11 +32,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::delegation::{self, SignedDelegation};
+use crate::identities::Identities;
 
-const AUTHORIZE_HTML: &str = include_str!("../static/authorize.html");
 const CODE_TTL: Duration = Duration::from_secs(120);
-const NONCE_TTL: Duration = Duration::from_secs(300);
+/// How long a started connect (pending II `/mcp` round-trip) stays valid.
+const CONNECT_TTL: Duration = Duration::from_secs(600);
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 
 /// Public base URL clients use to reach this server. Override with PUBLIC_URL.
@@ -42,12 +44,17 @@ pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuthStore {
     clients: Arc<RwLock<HashMap<String, OAuthClientConfig>>>,
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
-    nonces: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Pending connects keyed by the single-use `state` carried through II's
+    /// `/mcp` flow (set at authorize, consumed at the callback).
+    connects: Arc<RwLock<HashMap<String, PendingConnect>>>,
+    /// Shared with the MCP tools: the connect callback stores the standing
+    /// credential here, keyed by `session_id`, for the tools to sign with.
+    identities: Identities,
 }
 
 #[derive(Clone, Debug)]
@@ -56,11 +63,27 @@ struct CodeGrant {
     scope: Option<String>,
     /// Verified Internet Identity principal.
     principal: String,
-    /// Session id minted at approve and carried to the issued token. It keys
+    /// Session id minted at authorize and carried to the issued token. It keys
     /// the connection's per-session backend key, standing II credential, and
     /// on-demand per-app account delegations (see `crate::identities`).
     session_id: String,
     code_challenge: Option<String>,
+    created: Instant,
+}
+
+/// A connect started at `/oauth/authorize`, awaiting the delegation II will
+/// form-POST back to `/oauth/connect/callback`.
+#[derive(Clone, Debug)]
+struct PendingConnect {
+    client_id: String,
+    redirect_uri: String,
+    scope: Option<String>,
+    /// The OAuth client's own `state`, echoed back on the final redirect.
+    client_state: String,
+    code_challenge: Option<String>,
+    /// The connection's session id (its backend key already exists in
+    /// `identities`); the standing credential lands here.
+    session_id: String,
     created: Instant,
 }
 
@@ -72,8 +95,14 @@ struct TokenInfo {
 }
 
 impl AuthStore {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(identities: Identities) -> Self {
+        Self {
+            clients: Arc::default(),
+            codes: Arc::default(),
+            tokens: Arc::default(),
+            connects: Arc::default(),
+            identities,
+        }
     }
 
     /// Accept a client for the OAuth flow, lazily recording it if unseen.
@@ -106,16 +135,7 @@ impl AuthStore {
 
 }
 
-// ---- Nonce: server-issued challenge for the login proof ----------------
-
-/// GET /oauth/nonce — a fresh nonce the browser signs with its II identity.
-pub async fn nonce(State(store): State<AuthStore>) -> Response {
-    let nonce = Uuid::new_v4().to_string();
-    store.nonces.write().await.insert(nonce.clone(), Instant::now());
-    Json(json!({ "nonce": nonce })).into_response()
-}
-
-// ---- Authorize: serve the II login page --------------------------------
+// ---- Authorize: start the II /mcp delegation flow ----------------------
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
@@ -123,129 +143,136 @@ pub struct AuthorizeQuery {
     response_type: Option<String>,
     client_id: String,
     redirect_uri: String,
-}
-
-/// GET /oauth/authorize — validate the client, then serve the II-login page,
-/// which reads remaining OAuth params (state, code_challenge, scope) from
-/// `location.search`.
-pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
-    if store.validate_client(&q.client_id, &q.redirect_uri).await {
-        // Point the login page at the same II instance used by the app
-        // delegation flow (see crate::identities::ii_url). Escape for the JS
-        // string literal it lands in so a stray `"`/`\`/`</script>` in config
-        // can't break out of the string.
-        let ii = crate::identities::ii_url()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('<', "\\x3c");
-        let page = AUTHORIZE_HTML.replace("__II_URL__", &ii);
-        Html(page).into_response()
-    } else {
-        oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri")
-    }
-}
-
-// ---- Approve: verify the II login proof, mint an auth code -------------
-
-#[derive(Debug, Deserialize)]
-pub struct ApproveBody {
-    client_id: String,
-    redirect_uri: String,
     #[serde(default)]
-    scope: String,
-    #[serde(default)]
-    state: String,
+    state: Option<String>,
     #[serde(default)]
     code_challenge: Option<String>,
-    nonce: String,
-    /// Hex DER of the delegation-chain root public key (the II identity).
-    pubkey: String,
-    /// Delegation chain as produced by `DelegationChain.toJSON()`.
-    delegations: Vec<DelegationJson>,
-    /// Hex signature over the nonce by the leaf (session) key.
-    signature: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DelegationJson {
-    delegation: DelegationInner,
-    signature: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DelegationInner {
-    pubkey: String,
-    /// Nanoseconds since epoch, hex-encoded (agent-js bigint form).
-    expiration: String,
+    #[allow(dead_code)]
     #[serde(default)]
-    targets: Option<Vec<String>>,
+    code_challenge_method: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
-/// POST /oauth/approve (JSON) — called by the authorize page after a successful
-/// id.ai login. Verifies the delegation chain + nonce signature, then returns
-/// the redirect URL carrying a principal-bound authorization code.
-pub async fn approve(State(store): State<AuthStore>, Json(body): Json<ApproveBody>) -> Response {
-    if !store.validate_client(&body.client_id, &body.redirect_uri).await {
-        return oauth_err(StatusCode::BAD_REQUEST, "invalid_client", "unknown client / redirect_uri");
+/// GET /oauth/authorize — validate the client, mint this connection's session
+/// (its backend key), and redirect the browser to II's `/mcp` delegation flow,
+/// sending the backend **public** key. II will log the user in, then form-POST
+/// the delegation chain back to `/oauth/connect/callback`.
+pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<AuthorizeQuery>) -> Response {
+    if !store.validate_client(&q.client_id, &q.redirect_uri).await {
+        return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown client_id / redirect_uri");
     }
 
-    // Consume the nonce (single use, must be fresh).
-    match store.nonces.write().await.remove(&body.nonce) {
-        Some(issued) if issued.elapsed() < NONCE_TTL => {}
-        Some(_) => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "nonce expired"),
-        None => return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "unknown nonce"),
-    }
-
-    let principal = match verify_login_proof(&body) {
-        Ok(p) => p.to_text(),
-        Err(e) => return oauth_err(StatusCode::UNAUTHORIZED, "access_denied", &e),
-    };
-
-    let code = format!("mcp-code-{}", Uuid::new_v4());
     let session_id = format!("sess-{}", Uuid::new_v4());
-    store.codes.write().await.insert(
-        code.clone(),
-        CodeGrant {
-            client_id: body.client_id.clone(),
-            scope: (!body.scope.is_empty()).then(|| body.scope.clone()),
-            principal: principal.clone(),
-            session_id: session_id.clone(),
-            code_challenge: body.code_challenge.clone(),
+    let pubkey_b64 = store.identities.session_pubkey_b64(&session_id).await;
+
+    let connect_state = Uuid::new_v4().to_string();
+    store.connects.write().await.insert(
+        connect_state.clone(),
+        PendingConnect {
+            client_id: q.client_id.clone(),
+            redirect_uri: q.redirect_uri.clone(),
+            scope: q.scope.clone().filter(|s| !s.is_empty()),
+            client_state: q.state.clone().unwrap_or_default(),
+            code_challenge: q.code_challenge.clone(),
+            session_id,
             created: Instant::now(),
         },
     );
-    tracing::info!(%principal, "verified II login, issued authorization code");
 
-    let mut redirect = format!("{}?code={}", body.redirect_uri, code);
-    if !body.state.is_empty() {
-        redirect.push_str(&format!("&state={}", body.state));
-    }
-    Json(json!({ "redirect": redirect })).into_response()
+    // II `/mcp` flow: backend public key out, delegation in. `app` is the MCP
+    // origin (so the delegation's principal = derive(anchor, mcp_origin), the
+    // caller II's account-delegation methods authorize); `ttl` is 60 minutes.
+    let base = base_url();
+    let callback = format!("{base}/oauth/connect/callback");
+    let ttl_ns: u64 = 60 * 60 * 1_000_000_000;
+    let ii_mcp_url = format!(
+        "{ii}/mcp#public_key={pk}&callback={cb}&state={st}&app={app}&ttl={ttl}",
+        ii = crate::identities::ii_url(),
+        pk = urlencoding::encode(&pubkey_b64),
+        cb = urlencoding::encode(&callback),
+        st = urlencoding::encode(&connect_state),
+        app = urlencoding::encode(&base),
+        ttl = ttl_ns,
+    );
+    fragment_redirect(&ii_mcp_url)
 }
 
-fn verify_login_proof(body: &ApproveBody) -> Result<candid::Principal, String> {
-    let root = hex::decode(&body.pubkey).map_err(|_| "bad pubkey hex")?;
-    let sig = hex::decode(&body.signature).map_err(|_| "bad signature hex")?;
-    let mut chain = Vec::with_capacity(body.delegations.len());
-    for d in &body.delegations {
-        let targets = match &d.delegation.targets {
-            Some(ts) => Some(
-                ts.iter()
-                    .map(|t| hex::decode(t).map_err(|_| "bad target hex".to_string()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            None => None,
-        };
-        chain.push(SignedDelegation {
-            pubkey: hex::decode(&d.delegation.pubkey).map_err(|_| "bad delegation pubkey hex")?,
-            expiration: u64::from_str_radix(d.delegation.expiration.trim_start_matches("0x"), 16)
-                .map_err(|_| "bad expiration")?,
-            targets,
-            signature: hex::decode(&d.signature).map_err(|_| "bad delegation signature hex")?,
-        });
+// ---- Connect callback: II form-POSTs the delegation chain here ---------
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectCallback {
+    /// `DelegationChain.toJSON()` for `anchor -> backend session key`.
+    delegation: String,
+    /// The single-use connect state set at `/oauth/authorize`.
+    state: String,
+}
+
+/// POST /oauth/connect/callback — verify and store the standing credential, then
+/// redirect the browser back to the OAuth client with a principal-bound code.
+pub async fn connect_callback(
+    State(store): State<AuthStore>,
+    Form(form): Form<ConnectCallback>,
+) -> Response {
+    let pending = match store.connects.write().await.remove(&form.state) {
+        Some(p) if p.created.elapsed() < CONNECT_TTL => p,
+        Some(_) => return connect_error("connect request expired — reconnect and try again"),
+        None => return connect_error("unknown or already-used connect request"),
+    };
+
+    let principal = match store
+        .identities
+        .accept_standing(&pending.session_id, &form.delegation)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return connect_error(&format!("could not accept Internet Identity credential: {e}")),
+    };
+
+    let code = format!("mcp-code-{}", Uuid::new_v4());
+    store.codes.write().await.insert(
+        code.clone(),
+        CodeGrant {
+            client_id: pending.client_id.clone(),
+            scope: pending.scope.clone(),
+            principal: principal.clone(),
+            session_id: pending.session_id.clone(),
+            code_challenge: pending.code_challenge.clone(),
+            created: Instant::now(),
+        },
+    );
+    tracing::info!(%principal, "captured standing II credential, issued authorization code");
+
+    let mut redirect = format!("{}?code={}", pending.redirect_uri, code);
+    if !pending.client_state.is_empty() {
+        redirect.push_str(&format!("&state={}", urlencoding::encode(&pending.client_state)));
     }
-    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    delegation::verify_login(body.nonce.as_bytes(), &root, &chain, &sig, now_ns)
+    Redirect::to(&redirect).into_response()
+}
+
+/// Top-level redirect to a URL whose **fragment** must survive (II reads its
+/// params from `#…`). A `Location` header drops the fragment in some clients, so
+/// navigate via script instead.
+fn fragment_redirect(url: &str) -> Response {
+    let safe = url
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('<', "\\x3c");
+    Html(format!(
+        "<!DOCTYPE html><meta charset=utf-8><script>location.replace(\"{safe}\")</script>"
+    ))
+    .into_response()
+}
+
+fn connect_error(message: &str) -> Response {
+    let safe = message.replace('<', "&lt;");
+    (
+        StatusCode::BAD_REQUEST,
+        Html(format!(
+            "<!DOCTYPE html><meta charset=utf-8><body style=\"font-family:system-ui;max-width:32rem;margin:3rem auto\"><h1>Could not connect</h1><p>{safe}</p></body>"
+        )),
+    )
+        .into_response()
 }
 
 // ---- Token: exchange auth code for an access token ---------------------

@@ -48,17 +48,18 @@ pub struct SignedDelegation {
     pub signature: Vec<u8>,
 }
 
-/// Verify the chain + nonce signature; return the verified self-authenticating principal.
-pub fn verify_login(
-    nonce: &[u8],
+/// Verify a delegation chain: each delegation signed by the previous key (root
+/// first), the root checked as an II canister signature against the IC root key,
+/// none expired. The chain itself is the proof of identity for the connect-time
+/// standing credential — possession of the key the chain ends at is proven
+/// later, when the backend signs canister calls with it. Returns the verified
+/// self-authenticating principal of the chain root (the II `user_key`).
+pub fn verify_chain(
     root_pubkey_der: &[u8],
     delegations: &[SignedDelegation],
-    nonce_signature: &[u8],
     now_ns: u64,
 ) -> Result<Principal, String> {
     let principal = Principal::self_authenticating(root_pubkey_der);
-
-    // Walk the chain: each delegation is signed by the previous key (root first).
     let mut signer_der = root_pubkey_der.to_vec();
     for d in delegations {
         if d.expiration <= now_ns {
@@ -68,11 +69,6 @@ pub fn verify_login(
         verify_chain_link(&signer_der, &message, &d.signature)?;
         signer_der = d.pubkey.clone();
     }
-
-    // The leaf (session) key must have signed the server's nonce.
-    verify_basic_sig(&signer_der, nonce, nonce_signature)
-        .map_err(|e| format!("nonce signature invalid: {e}"))?;
-
     Ok(principal)
 }
 
@@ -142,12 +138,12 @@ mod tests {
         [P256_SPKI_PREFIX, point.as_bytes()].concat()
     }
 
-    /// Ed25519 root delegates to a P-256 session key, which signs the nonce.
-    /// Exercises both the chain-link (basic Ed25519) and leaf (P-256) paths.
+    /// Ed25519 root delegates to a P-256 session key. Exercises the chain-link
+    /// (basic Ed25519) path and derives the principal from the root.
     #[test]
     fn verifies_valid_chain_and_derives_principal() {
         use ed25519_dalek::{Signer as _, SigningKey};
-        use p256::ecdsa::{Signature as P256Sig, SigningKey as P256Key};
+        use p256::ecdsa::SigningKey as P256Key;
 
         let root = SigningKey::from_bytes(&[7u8; 32]);
         let root_der = ed25519_der(&root.verifying_key());
@@ -156,7 +152,7 @@ mod tests {
 
         let now_ns = 1_000_000_000_000u64;
         let deleg = SignedDelegation {
-            pubkey: session_der.clone(),
+            pubkey: session_der,
             expiration: now_ns + 3_600_000_000_000,
             targets: None,
             signature: vec![], // filled below
@@ -165,17 +161,12 @@ mod tests {
         let root_sig = root.sign(&msg).to_bytes().to_vec();
         let deleg = SignedDelegation { signature: root_sig, ..deleg };
 
-        let nonce = b"server-issued-nonce";
-        let nonce_sig: P256Sig = session.sign(nonce);
-        let nonce_sig = nonce_sig.to_bytes().to_vec();
-
-        let principal =
-            verify_login(nonce, &root_der, &[deleg], &nonce_sig, now_ns).expect("should verify");
+        let principal = verify_chain(&root_der, &[deleg], now_ns).expect("should verify");
         assert_eq!(principal, Principal::self_authenticating(&root_der));
     }
 
     #[test]
-    fn rejects_tampered_nonce_signature() {
+    fn rejects_tampered_delegation_signature() {
         use ed25519_dalek::{Signer as _, SigningKey};
         let root = SigningKey::from_bytes(&[1u8; 32]);
         let root_der = ed25519_der(&root.verifying_key());
@@ -188,9 +179,10 @@ mod tests {
             targets: None,
             signature: vec![],
         };
-        deleg.signature = root.sign(&delegation_message(&deleg)).to_bytes().to_vec();
-        let bad_sig = session.sign(b"a-different-nonce").to_bytes().to_vec();
-        assert!(verify_login(b"the-real-nonce", &root_der, &[deleg], &bad_sig, now_ns).is_err());
+        // A signature over a *different* delegation must not validate this one.
+        let other = SignedDelegation { expiration: now_ns + 2, ..deleg.clone() };
+        deleg.signature = root.sign(&delegation_message(&other)).to_bytes().to_vec();
+        assert!(verify_chain(&root_der, &[deleg], now_ns).is_err());
     }
 
     #[test]
@@ -208,7 +200,6 @@ mod tests {
             signature: vec![],
         };
         deleg.signature = root.sign(&delegation_message(&deleg)).to_bytes().to_vec();
-        let nonce_sig = session.sign(b"n").to_bytes().to_vec();
-        assert!(verify_login(b"n", &root_der, &[deleg], &nonce_sig, now_ns).is_err());
+        assert!(verify_chain(&root_der, &[deleg], now_ns).is_err());
     }
 }

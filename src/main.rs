@@ -422,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let store = auth::AuthStore::new();
+    let store = auth::AuthStore::new(identities.clone());
 
     // /mcp is gated by a bearer token issued after Internet Identity login.
     let protected_mcp = axum::Router::new()
@@ -447,8 +447,7 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::get(auth::protected_resource_metadata),
         )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
-        .route("/oauth/nonce", axum::routing::get(auth::nonce))
-        .route("/oauth/approve", axum::routing::post(auth::approve))
+        .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
         .route("/oauth/token", axum::routing::post(auth::token))
         .route("/oauth/register", axum::routing::post(auth::register))
         .layer(cors)
