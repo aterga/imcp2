@@ -2,5 +2,16 @@
   email __ACME_EMAIL__
 }
 __DOMAIN__ {
-  reverse_proxy 127.0.0.1:8000
+  # Status dashboard (internal Node service on :8137), published under /status/.
+  # handle_path strips the /status prefix, so the dashboard sees /, /api/status,
+  # etc. as if mounted at the root; its assets are loaded path-relative.
+  redir /status /status/ 308
+  handle_path /status/* {
+    reverse_proxy 127.0.0.1:8137
+  }
+
+  # Everything else is the MCP server.
+  handle {
+    reverse_proxy 127.0.0.1:8000
+  }
 }

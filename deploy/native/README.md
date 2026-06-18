@@ -8,11 +8,19 @@ Run `mcp-poc` directly on an **existing** Amazon Linux 2023 (arm64) host as nati
 ```
    build.sh  ─────►  build-out/mcp-poc        (cross-built linux/arm64 binary)
    deploy.sh ─────►  /opt/imcp2/{mcp-poc,static}   + systemd: mcp-poc.service
+                     /opt/imcp2/monitoring         + systemd: imcp-status.service (dashboard)
                      /usr/local/bin/caddy          + systemd: caddy.service (TLS)
 ```
 
 `mcp-poc` listens on `127.0.0.1:8000`/`0.0.0.0:8000`; **Caddy** terminates HTTPS for
 your domain and reverse-proxies to it, obtaining a Let's Encrypt cert automatically.
+
+The **status dashboard** (`monitoring/mcp-status`) is also shipped and run as a
+Node systemd service (`imcp-status.service`) bound to `127.0.0.1:8137`. Caddy
+publishes it at **`https://$DOMAIN/status/`**, where it probes the deployment's
+own public endpoints and the linked Internet Identity instance. Node ≥ 20 is
+installed automatically on first deploy if absent; the dashboard has no build
+step and no third-party dependencies.
 
 ## Quick start
 
@@ -91,8 +99,10 @@ the box publicly reachable and report the address to set DNS *before* the deploy
 
 [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs this same
 native deploy automatically on every push to `main` (and can be re-run by hand from the
-Actions tab). It cross-builds the arm64 binary with `build.sh`, then runs `deploy.sh`
-over SSH. A `concurrency` group serializes deploys so two never overlap.
+Actions tab). It first runs the status dashboard's unit tests (a regression there stops
+the rollout), cross-builds the arm64 binary with `build.sh`, then runs `deploy.sh`
+over SSH — which ships and (re)starts both the app and the dashboard service. A
+`concurrency` group serializes deploys so two never overlap.
 
 Configure these repository secrets (**Settings → Secrets and variables → Actions**):
 
@@ -111,17 +121,23 @@ workflow only automates the build-and-ship step, not provisioning the box.
 
 ```sh
 ssh <host>
-sudo systemctl status mcp-poc caddy
+sudo systemctl status mcp-poc caddy imcp-status
 sudo journalctl -u mcp-poc -f      # app logs
 sudo journalctl -u caddy -f        # TLS / cert logs
+sudo journalctl -u imcp-status -f  # status dashboard logs
 ```
+
+The dashboard is at `https://<domain>/status/`. To probe a different target or
+extend its SSRF allowlist, edit `Environment=`/`ExecStart=` in
+`/etc/systemd/system/imcp-status.service` and `systemctl restart imcp-status`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `build.sh` | Cross-build `build-out/mcp-poc` (linux/arm64, bullseye glibc) |
-| `deploy.sh` | Ship binary + `static/`, render & install units/Caddyfile, (re)start services |
+| `deploy.sh` | Ship binary + `static/` + `monitoring/`, render & install units/Caddyfile, (re)start services |
 | `mcp-poc.service` | systemd unit for the app (`__PUBLIC_URL__` substituted at deploy) |
+| `imcp-status.service` | systemd unit for the status dashboard (`__DOMAIN__`, `__ALLOWED_HOSTS__` substituted at deploy) |
 | `caddy.service` | systemd unit for Caddy |
 | `Caddyfile` | Caddy config (`__DOMAIN__`, `__ACME_EMAIL__` substituted at deploy) |
