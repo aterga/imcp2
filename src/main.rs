@@ -16,7 +16,7 @@ mod discover;
 mod identities;
 
 use candid::{types::value::IDLArgs, Principal};
-use ic_agent::Agent;
+use ic_agent::{Agent, Identity};
 use identities::Identities;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -106,6 +106,15 @@ fn default_identity() -> String {
 struct DiscoverCanistersArgs {
     /// A web domain or URL served from the IC, e.g. "oisy.com".
     domain: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetPrincipalArgs {
+    /// Whose principal to return: "anonymous" (default) or a domain (e.g.
+    /// "oisy.com"), in which case the account delegation for that app is derived
+    /// on demand (same as call_canister) and its principal returned.
+    #[serde(default = "default_identity")]
+    identity: String,
 }
 
 #[derive(Clone)]
@@ -205,6 +214,31 @@ impl IcTools {
         };
         // Decode against the canister's Candid interface so field names are recovered.
         Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
+    }
+
+    #[tool(
+        description = "Get the Internet Computer principal you would call as for a given `identity`, without making a canister call. \"anonymous\" (default) returns the anonymous principal; a domain (e.g. \"oisy.com\") derives that app's account delegation on demand (same as call_canister) from this connection's standing Internet Identity credential and returns its principal. Use this when a flow needs the principal itself (e.g. to look up a balance/account) rather than to invoke a method."
+    )]
+    async fn get_principal(
+        &self,
+        Parameters(GetPrincipalArgs { identity }): Parameters<GetPrincipalArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if identity == "anonymous" {
+            return Ok(ok(Principal::anonymous().to_text()));
+        }
+        let session_id = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("a domain identity needs an authenticated session".into())),
+        };
+        let delegated = match self.identities.delegated_identity(&session_id, &identity).await {
+            Ok(d) => d,
+            Err(e) => return Ok(err(e)),
+        };
+        match delegated.sender() {
+            Ok(p) => Ok(ok(p.to_text())),
+            Err(e) => Ok(err(format!("could not derive principal for '{identity}': {e}"))),
+        }
     }
 
     #[tool(
@@ -326,9 +360,11 @@ impl ServerHandler for IcTools {
              `call_canister` calls a method with textual Candid in/out, AS an `identity`: \
              \"anonymous\" by default, or a domain (e.g. identity=\"oisy.com\") — for a domain, a \
              short-lived (<=5 min) account delegation for that app is minted ON DEMAND from this \
-             connection's standing Internet Identity credential, with no extra sign-in step. The \
-             standing credential is obtained when you connect (authenticate via Internet \
-             Identity) and lasts ~60 minutes; reconnect when it expires."
+             connection's standing Internet Identity credential, with no extra sign-in step. \
+             `get_principal` returns the principal for an `identity` (anonymous or a domain) \
+             without making a call — use it when a flow just needs the principal (e.g. to look up \
+             a balance or account). The standing credential is obtained when you connect \
+             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires."
                 .to_string(),
         )
     }
@@ -385,7 +421,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as <code>anonymous</code>, or as a domain identity derived on demand from the connection's standing Internet Identity delegation). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as <code>anonymous</code>, or as a domain identity derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (the principal for an identity, no call). All speak textual Candid.</p>
 </body></html>"#;
 
 #[tokio::main]

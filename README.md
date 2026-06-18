@@ -14,6 +14,7 @@ encoding/decoding and signing against the IC via
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `identity` | Reply as textual Candid, called as `anonymous` or as a domain identity derived on demand |
+| `get_principal` | `identity` | The principal for `anonymous` or a domain (derives the delegation on demand, same as `call_canister`), without making a call |
 
 `discover_canisters` is the entry point when the user names a **website** instead
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
