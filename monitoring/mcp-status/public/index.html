@@ -316,7 +316,9 @@
         try {
           // Targets are fixed by the server at startup (the server does not
           // accept per-request targets), so no query parameters are sent.
-          const res = await fetch("/api/status");
+          // Path-relative so the dashboard works both at the site root and
+          // when mounted under a sub-path (e.g. behind Caddy at /status/).
+          const res = await fetch("api/status");
           render(await res.json());
         } catch (e) {
           $("content").innerHTML =

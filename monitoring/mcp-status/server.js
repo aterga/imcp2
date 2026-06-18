@@ -12,7 +12,10 @@
 // page must never let a visitor steer server-side requests at arbitrary hosts.
 //
 // Usage:
-//   node monitoring/mcp-status/server.js [--port 8080] [--mcp <origin>] [--ii <origin>]
+//   node monitoring/mcp-status/server.js [--port 8080] [--host 127.0.0.1] [--mcp <origin>] [--ii <origin>]
+//
+// Binds to 127.0.0.1 by default so the probe endpoint is not directly exposed;
+// front it with a TLS reverse proxy (e.g. Caddy) to publish it.
 
 import http from "node:http";
 import { readFile } from "node:fs/promises";
@@ -133,9 +136,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 const port = parsePort();
-server.listen(port, () => {
+// Default to loopback: behind a reverse proxy (the intended deployment) the
+// dashboard should not be reachable directly. Override with --host/MCP_STATUS_HOST
+// (e.g. 0.0.0.0) only when binding all interfaces is genuinely wanted.
+const host = argValue("--host") ?? process.env.MCP_STATUS_HOST ?? "127.0.0.1";
+server.listen(port, host, () => {
   process.stdout.write(
-    `IMCP status dashboard listening on http://localhost:${port}\n` +
+    `IMCP status dashboard listening on http://${host}:${port}\n` +
       `  monitoring: ${defaults.mcpOrigin ?? "https://mcp.beta.id.ai (default)"}\n`,
   );
 });

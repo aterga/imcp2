@@ -1,0 +1,21 @@
+[Unit]
+Description=imcp2 status dashboard (mcp-status)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/imcp2/monitoring/mcp-status
+# Probe the public deployment end-to-end (through Caddy/TLS). The II origin is
+# derived from the MCP origin (mcp.<env>.id.ai -> <env>.id.ai). The allowlist is
+# pinned to the deployment's own domain so the probes can never be steered
+# elsewhere. Binds to 127.0.0.1; Caddy publishes it under https://<domain>/status/.
+Environment=MCP_STATUS_ALLOWED_HOSTS=__ALLOWED_HOSTS__
+ExecStart=/usr/bin/node /opt/imcp2/monitoring/mcp-status/server.js --port 8137 --host 127.0.0.1 --mcp https://__DOMAIN__
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

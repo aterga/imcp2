@@ -35,6 +35,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Gate the deploy on the status dashboard's unit tests. They are fast and
+      # network-free, and the dashboard is shipped (and run as a systemd service)
+      # by deploy.sh, so a regression here should stop the rollout.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test status dashboard
+        run: npm test --prefix monitoring/mcp-status
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

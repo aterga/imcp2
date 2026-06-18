@@ -63,6 +63,20 @@ plus loopback hosts for local development, may be probed. To monitor a
 deployment on another domain, extend the allowlist via the
 `MCP_STATUS_ALLOWED_HOSTS` environment variable (comma-separated host suffixes).
 
+`server.js` binds to `127.0.0.1` by default; override with `--host` /
+`MCP_STATUS_HOST` only when you really mean to expose the port directly.
+`/api/status` is cached for a short TTL (`MCP_STATUS_CACHE_TTL_MS`, default
+15 s) and concurrent requests are coalesced into one probe run, so multiple
+tabs / refreshes don't multiply load on the monitored server.
+
+### Deployment
+
+The standard deploy ([`deploy/native`](../../deploy/native)) ships this tool to
+the host and runs it as the `imcp-status.service` systemd unit (bound to
+`127.0.0.1:8137`, monitoring the deployment's own public origin). Caddy
+publishes it at `https://<domain>/status/`, and the CI workflow runs the unit
+tests below before rolling out. See the deploy README for details.
+
 ## Why a standalone tool (and not a page in the II frontend)?
 
 The II frontend is a **static, prerendered, `ssr: false` SvelteKit app** served
