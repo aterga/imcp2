@@ -772,41 +772,74 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       : "no form-action directive found in CSP",
   });
 
-  // 3b. II config descriptor: the II frontend publishes its Candid config blob
-  //     at /.config.did.bin — the source of truth for the II canister's
-  //     configuration (the form-action CSP above is derived from it). Confirm it
-  //     is served so the config the II runs on is independently observable.
+  // 3b. II frontend config: the II serves its runtime config as a textual
+  //     Candid record at /.config. It is the source of truth the form-action
+  //     CSP above is derived from — in particular its `mcp_server_origin` field
+  //     names the MCP server this II trusts. Confirm it is served and read that
+  //     field back out.
+  let configMcpOrigin;
   {
-    const url = `${iiOrigin}/.config.did.bin`;
+    const url = `${iiOrigin}/.config`;
     const cr = await probe(url, { timeoutMs });
-    // Use the server-reported byte count; `bodyText.length` counts UTF-16 code
-    // units (probe() decodes the body as text), which misreports a binary blob.
-    const lenHeader = Number(cr.headers.get("content-length"));
+    // The config is text/plain Candid, so bodyText is the real content; prefer
+    // the server-reported content-length for the byte count when present. (Guard
+    // against a missing header: Number(null) is 0, which would wrongly win here.)
+    // Fall back to the UTF-8 byte length, not String#length (UTF-16 code units).
+    const lenRaw = cr.headers.get("content-length");
+    const lenHeader = lenRaw === null ? NaN : Number(lenRaw);
     const bytes =
-      Number.isFinite(lenHeader) && lenHeader >= 0 ? lenHeader : undefined;
-    const nonEmpty = bytes !== undefined ? bytes > 0 : cr.bodyText.length > 0;
-    const contentType = cr.headers.get("content-type") ?? "";
-    const present = cr.ok && cr.status === 200 && nonEmpty;
-    facts.configDid = {
+      Number.isFinite(lenHeader) && lenHeader >= 0
+        ? lenHeader
+        : Buffer.byteLength(cr.bodyText, "utf8");
+    const looksLikeConfig =
+      /\brecord\s*\{/.test(cr.bodyText) ||
+      cr.bodyText.includes("backend_canister_id");
+    // Extract `mcp_server_origin = opt "<origin>"` from the textual Candid.
+    const m = cr.bodyText.match(/mcp_server_origin\s*=\s*opt\s*"([^"]+)"/);
+    configMcpOrigin = m ? m[1] : undefined;
+    const present = cr.ok && cr.status === 200 && looksLikeConfig;
+    facts.config = {
       status: cr.status,
       bytes,
-      contentType: contentType || undefined,
+      mcpServerOrigin: configMcpOrigin,
     };
     checks.push({
-      id: "ii-config-did",
-      label: "II config descriptor (.config.did.bin)",
+      id: "ii-config",
+      label: "II frontend config (.config)",
       description:
-        "Checks the II frontend publishes its Candid config blob at /.config.did.bin — the source of truth for the II canister's configuration, including the MCP origins it trusts.",
+        "Checks the II frontend serves its runtime config (textual Candid) at /.config — the source of truth the form-action CSP is derived from, including the mcp_server_origin it trusts.",
       target: `GET ${url}`,
-      expected: "200 with a non-empty Candid config blob",
+      expected: "200 textual Candid config record",
       status: present ? "pass" : cr.status === 200 ? "warn" : "fail",
       httpStatus: cr.status,
       latencyMs: cr.latencyMs,
       detail: cr.error
         ? `request failed: ${cr.error.message}`
-        : bytes !== undefined
-          ? `${cr.status}, ${bytes} bytes${contentType ? `, ${contentType}` : ""}`
-          : `${cr.status}${contentType ? `, ${contentType}` : ""}`,
+        : present
+          ? `${cr.status}, ${bytes} bytes, mcp_server_origin=${configMcpOrigin ?? "(absent)"}`
+          : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
+    });
+  }
+
+  // 3c. The config's mcp_server_origin must name this exact MCP server. This is
+  //     the authoritative config-level counterpart to the form-action CSP check.
+  {
+    const matches = configMcpOrigin === mcpOrigin;
+    checks.push({
+      id: "ii-config-mcp-origin",
+      label: "Config mcp_server_origin matches",
+      description:
+        "Verifies the II config's mcp_server_origin names exactly this MCP server — the authoritative config field the II's recognition (and its form-action CSP) is derived from.",
+      target: `${iiOrigin}/.config → mcp_server_origin`,
+      expected: `mcp_server_origin = opt "${mcpOrigin}"`,
+      status: matches ? "pass" : configMcpOrigin ? "fail" : "warn",
+      httpStatus: null,
+      latencyMs: null,
+      detail: configMcpOrigin
+        ? matches
+          ? `mcp_server_origin = ${configMcpOrigin}`
+          : `mcp_server_origin = ${configMcpOrigin} (expected ${mcpOrigin})`
+        : "no mcp_server_origin found in /.config",
     });
   }
 
