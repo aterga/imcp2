@@ -784,12 +784,13 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     // The config is text/plain Candid, so bodyText is the real content; prefer
     // the server-reported content-length for the byte count when present. (Guard
     // against a missing header: Number(null) is 0, which would wrongly win here.)
+    // Fall back to the UTF-8 byte length, not String#length (UTF-16 code units).
     const lenRaw = cr.headers.get("content-length");
     const lenHeader = lenRaw === null ? NaN : Number(lenRaw);
     const bytes =
       Number.isFinite(lenHeader) && lenHeader >= 0
         ? lenHeader
-        : cr.bodyText.length;
+        : Buffer.byteLength(cr.bodyText, "utf8");
     const looksLikeConfig =
       /\brecord\s*\{/.test(cr.bodyText) ||
       cr.bodyText.includes("backend_canister_id");
@@ -830,7 +831,7 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       description:
         "Verifies the II config's mcp_server_origin names exactly this MCP server — the authoritative config field the II's recognition (and its form-action CSP) is derived from.",
       target: `${iiOrigin}/.config → mcp_server_origin`,
-      expected: `mcp_server_origin = "${mcpOrigin}"`,
+      expected: `mcp_server_origin = opt "${mcpOrigin}"`,
       status: matches ? "pass" : configMcpOrigin ? "fail" : "warn",
       httpStatus: null,
       latencyMs: null,

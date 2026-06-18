@@ -20,10 +20,11 @@ It answers three questions and adds a few suggestions:
    canister id and related origins, confirms it serves its runtime config
    (textual Candid) at `/.config` and that the config's `mcp_server_origin`
    field names this MCP server, and verifies that the II's response CSP
-   `form-action` directive lists this MCP origin. Both are derived server-side
-   from the II canister's `mcp_server_origin` config, so they are the
-   authoritative signal that the II trusts this MCP server and that the `/mcp`
-   delegation flow is enabled for it.
+   `form-action` directive lists this MCP origin. The config's
+   `mcp_server_origin` is the source of truth — the `form-action` CSP is derived
+   from it server-side — so together they are the authoritative signal that the
+   II trusts this MCP server and that the `/mcp` delegation flow is enabled for
+   it.
 
 Every check carries a plain-language description, and the report shows which
 **deployment is running** — the MCP server's version and git commit (read from
