@@ -9,7 +9,12 @@
 // point that returns a fully structured, JSON-serialisable report.
 
 import tls from "node:tls";
-import { deriveIiOrigin, isAllowedOrigin, resolveConfig } from "./config.js";
+import {
+  commitUrl,
+  deriveIiOrigin,
+  isAllowedOrigin,
+  resolveConfig,
+} from "./config.js";
 
 /**
  * @typedef {"pass" | "warn" | "fail"} Status
@@ -17,6 +22,7 @@ import { deriveIiOrigin, isAllowedOrigin, resolveConfig } from "./config.js";
  * @typedef {Object} CheckResult
  * @property {string} id
  * @property {string} label
+ * @property {string} description   Plain-language explanation of what this checks and why it matters.
  * @property {string} target        Human-readable target (method + url).
  * @property {string} expected      What a healthy server should return.
  * @property {Status} status
@@ -30,9 +36,15 @@ import { deriveIiOrigin, isAllowedOrigin, resolveConfig } from "./config.js";
  * @property {Status} status
  * @property {CheckResult[]} checks
  *
+ * @typedef {Object} Deployment
+ * @property {string | undefined} version  The running build's package version.
+ * @property {string | undefined} commit   The running build's git commit (or "unknown").
+ * @property {string | undefined} commitUrl GitHub URL for the commit, when it is a real SHA.
+ *
  * @typedef {Object} DashboardReport
  * @property {string} generatedAt
  * @property {{ mcpOrigin: string, iiOrigin: string | undefined, iiOriginSource: string }} targets
+ * @property {Deployment} deployment
  * @property {Status} overall
  * @property {Section[]} sections
  * @property {Record<string, unknown>} facts
@@ -179,6 +191,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "root",
       label: "Landing page",
+      description:
+        "Confirms the server is up and serving its human-facing landing page (HTTP 200, HTML) at the root URL.",
       target: `GET ${mcpOrigin}/`,
       expected: "200 text/html",
       status: pass ? "pass" : "fail",
@@ -187,6 +201,38 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       detail: r.error
         ? `request failed: ${r.error.message}`
         : `${r.status}, content-type: ${ct || "(none)"}`,
+    });
+  }
+
+  // 1b. Build/version: which commit is actually running. Surfaced prominently
+  //     in the report (with a GitHub link) so operators can confirm the live
+  //     deployment; older builds without /version are treated as informational.
+  {
+    const url = `${mcpOrigin}/version`;
+    const r = await probe(url, { timeoutMs });
+    const json = tryJson(r.bodyText);
+    const commit =
+      json && typeof json.commit === "string" ? json.commit : undefined;
+    const version =
+      json && typeof json.version === "string" ? json.version : undefined;
+    facts.deployment = { version, commit, commitUrl: commitUrl(commit) };
+    const exposed = r.ok && r.status === 200 && !!commit;
+    const known = exposed && commit !== "unknown";
+    checks.push({
+      id: "version",
+      label: "Deployment version",
+      description:
+        "Reports the running build's version and commit via GET /version, so you can confirm exactly which deployment is live and trace it back to source.",
+      target: `GET ${url}`,
+      expected: "200 JSON with version + commit",
+      status: known ? "pass" : "warn",
+      httpStatus: r.status,
+      latencyMs: r.latencyMs,
+      detail: r.error
+        ? `request failed: ${r.error.message}`
+        : exposed
+          ? `version ${version ?? "?"}, commit ${commit}`
+          : `${r.status}, no version info exposed`,
     });
   }
 
@@ -207,6 +253,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "protected-resource",
       label: "OAuth Protected Resource Metadata",
+      description:
+        "Verifies the RFC 9728 metadata document that tells MCP clients which authorization server protects the /mcp resource.",
       target: `GET ${url}`,
       expected: "200 JSON with authorization_servers + resource",
       status: pass ? (resourceOk ? "pass" : "warn") : "fail",
@@ -242,6 +290,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "as-metadata",
       label: "OAuth Authorization Server Metadata",
+      description:
+        "Verifies the RFC 8414 metadata advertising the authorize/token/registration endpoints and PKCE support that clients need to log in.",
       target: `GET ${url}`,
       expected: "200 JSON with issuer + authorize/token/register endpoints",
       status: pass ? "pass" : "fail",
@@ -267,6 +317,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "metadata-consistency",
       label: "Discovery documents are self-consistent",
+      description:
+        "Cross-checks the two discovery documents agree: the authorization server's issuer must match this origin and be listed as an authorization_server.",
       target: "oauth-protected-resource ↔ oauth-authorization-server",
       expected: "issuer === origin and listed as authorization_server",
       status: consistent ? "pass" : "warn",
@@ -310,6 +362,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "mcp-challenge",
       label: "MCP endpoint OAuth challenge",
+      description:
+        "Checks that an unauthenticated call to /mcp returns 401 with a WWW-Authenticate: Bearer challenge pointing at the resource metadata — the handshake MCP clients use to discover how to authenticate.",
       target: `POST ${url} (no token)`,
       expected: `401 + WWW-Authenticate: Bearer resource_metadata="${expectedMetadata}"`,
       status: challengeOk ? "pass" : r.status === 401 ? "warn" : "fail",
@@ -344,6 +398,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "oauth-register",
       label: "OAuth Dynamic Client Registration",
+      description:
+        "Confirms Dynamic Client Registration (RFC 7591) issues a client_id, so MCP clients can self-register without manual setup.",
       target: `POST ${url}`,
       expected: "200/201 JSON with client_id",
       status: pass ? "pass" : "fail",
@@ -367,6 +423,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "oauth-authorize",
       label: "OAuth Authorization endpoint liveness",
+      description:
+        "Confirms the authorization endpoint is alive and validates input, rejecting a malformed request with a 4xx rather than erroring or hanging.",
       target: `GET ${url} (no params)`,
       expected: "4xx (validates input; does not 5xx / hang)",
       status: alive ? "pass" : "fail",
@@ -392,6 +450,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
     checks.push({
       id: "oauth-token",
       label: "OAuth Token endpoint liveness",
+      description:
+        "Confirms the token endpoint is alive and rejects an invalid grant with a standards-compliant 400 OAuth error.",
       target: `POST ${url} (invalid grant)`,
       expected: "400 with OAuth error (e.g. invalid_grant)",
       status: alive ? "pass" : r.status === 400 ? "warn" : "fail",
@@ -411,6 +471,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       checks.push({
         id: "mcp-tls",
         label: "TLS certificate",
+        description:
+          "Checks the MCP host's TLS certificate is valid and not close to expiry.",
         target: mcpOrigin,
         expected: "valid certificate, > 21 days remaining",
         status: "warn",
@@ -422,6 +484,8 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       checks.push({
         id: "mcp-tls",
         label: "TLS certificate",
+        description:
+          "Checks the MCP host's TLS certificate is valid and not close to expiry.",
         target: mcpOrigin,
         expected: "valid certificate, > 21 days remaining",
         status:
@@ -554,6 +618,8 @@ export const checkLinkage = async (
   checks.push({
     id: "ii-target",
     label: "Linked Internet Identity instance",
+    description:
+      "Identifies which Internet Identity instance this MCP server is paired with (discovered live, explicitly configured, or derived from the naming convention).",
     target: mcpOrigin,
     expected: "a resolvable II origin",
     status: iiOrigin ? "pass" : "fail",
@@ -567,6 +633,8 @@ export const checkLinkage = async (
   checks.push({
     id: "ii-discovery",
     label: "Live link discovery via OAuth authorize",
+    description:
+      "Attempts to confirm the MCP→II pairing live by following the /oauth/authorize redirect to the II delegation page (informational: it only redirects after interactive client setup).",
     target: `${mcpOrigin}/oauth/authorize`,
     expected: "302 redirect to the II /mcp delegation page",
     // Inconclusive discovery is informational, not a failure: the MCP server
@@ -609,6 +677,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     checks.push({
       id: "ii-unresolved",
       label: "Internet Identity health",
+      description:
+        "No Internet Identity origin could be resolved, so its health and recognition of this MCP server cannot be assessed.",
       target: "(unknown)",
       expected: "a resolved II origin to probe",
       status: "fail",
@@ -638,6 +708,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   checks.push({
     id: "ii-reachable",
     label: "II frontend reachable",
+    description:
+      "Confirms the linked Internet Identity frontend is reachable and returns HTTP 200.",
     target: `GET ${iiOrigin}/`,
     expected: "200",
     status: r.ok && r.status === 200 ? "pass" : "fail",
@@ -652,6 +724,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   checks.push({
     id: "ii-certified",
     label: "IC-certified response (canister live)",
+    description:
+      "Checks the II response carries an ic-certificate header, indicating it is served and certified by a live Internet Computer canister.",
     target: `${iiOrigin}/`,
     expected: "ic-certificate header present",
     status: icCertificate ? "pass" : "warn",
@@ -672,6 +746,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   checks.push({
     id: "ii-recognises-mcp",
     label: "II recognises this MCP server",
+    description:
+      "Verifies the II's response CSP form-action directive lists this MCP origin — the authoritative signal that the II trusts this server and the /mcp delegation flow is enabled for it.",
     target: `${iiOrigin} CSP form-action`,
     expected: `form-action contains ${mcpOrigin}`,
     status: recognised ? "pass" : "fail",
@@ -684,6 +760,41 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       : "no form-action directive found in CSP",
   });
 
+  // 3b. II config descriptor: the II frontend publishes its Candid config blob
+  //     at /.config.did.bin — the source of truth for the II canister's
+  //     configuration (the form-action CSP above is derived from it). Confirm it
+  //     is served so the config the II runs on is independently observable.
+  {
+    const url = `${iiOrigin}/.config.did.bin`;
+    const cr = await probe(url, { timeoutMs });
+    const lenHeader = Number(cr.headers.get("content-length"));
+    const bytes =
+      Number.isFinite(lenHeader) && lenHeader > 0
+        ? lenHeader
+        : cr.bodyText.length;
+    const contentType = cr.headers.get("content-type") ?? "";
+    const present = cr.ok && cr.status === 200 && bytes > 0;
+    facts.configDid = {
+      status: cr.status,
+      bytes,
+      contentType: contentType || undefined,
+    };
+    checks.push({
+      id: "ii-config-did",
+      label: "II config descriptor (.config.did.bin)",
+      description:
+        "Checks the II frontend publishes its Candid config blob at /.config.did.bin — the source of truth for the II canister's configuration, including the MCP origins it trusts.",
+      target: `GET ${url}`,
+      expected: "200 with a non-empty Candid config blob",
+      status: present ? "pass" : cr.status === 200 ? "warn" : "fail",
+      httpStatus: cr.status,
+      latencyMs: cr.latencyMs,
+      detail: cr.error
+        ? `request failed: ${cr.error.message}`
+        : `${cr.status}, ${bytes} bytes${contentType ? `, ${contentType}` : ""}`,
+    });
+  }
+
   // 4. Report the II's configured related origins (context, not pass/fail).
   const frameAncestors = parseCspDirective(csp, "frame-ancestors");
   const relatedOrigins = (frameAncestors ?? []).filter((o) =>
@@ -693,6 +804,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   checks.push({
     id: "ii-related-origins",
     label: "II related origins",
+    description:
+      "Reports the II's configured related/alternative frontend origins (from the CSP frame-ancestors directive) for context.",
     target: `${iiOrigin} CSP frame-ancestors`,
     expected: "the II's alternative front-end origins",
     status: relatedOrigins.length > 0 ? "pass" : "warn",
@@ -711,6 +824,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     checks.push({
       id: "ii-tls",
       label: "TLS certificate",
+      description:
+        "Checks the Internet Identity host's TLS certificate is valid and not close to expiry.",
       target: iiOrigin,
       expected: "valid certificate, > 21 days remaining",
       status: "warn",
@@ -722,6 +837,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     checks.push({
       id: "ii-tls",
       label: "TLS certificate",
+      description:
+        "Checks the Internet Identity host's TLS certificate is valid and not close to expiry.",
       target: iiOrigin,
       expected: "valid certificate, > 21 days remaining",
       status:
@@ -856,6 +973,13 @@ export const runDashboard = async (overrides = {}) => {
       iiOrigin: linkage.iiOrigin,
       iiOriginSource: cfg.iiOriginSource,
     },
+    deployment: /** @type {Deployment} */ (
+      endpoints.facts.deployment ?? {
+        version: undefined,
+        commit: undefined,
+        commitUrl: undefined,
+      }
+    ),
     overall: worstStatus(sections.map((s) => s.status)),
     sections,
     facts,

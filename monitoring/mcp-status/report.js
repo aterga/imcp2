@@ -34,6 +34,20 @@ export const renderText = (report, opts = {}) => {
     `MCP server: ${c(ANSI.cyan, report.targets.mcpOrigin)}   ` +
       `II instance: ${c(ANSI.cyan, report.targets.iiOrigin ?? "(unresolved)")}`,
   );
+  const dep = report.deployment;
+  if (dep && (dep.version || dep.commit)) {
+    const shortCommit =
+      dep.commit && dep.commit !== "unknown"
+        ? dep.commit.slice(0, 12)
+        : dep.commit;
+    const label = [dep.version && `v${dep.version}`, shortCommit]
+      .filter(Boolean)
+      .join(" @ ");
+    lines.push(
+      `Deployment: ${c(ANSI.cyan, label || "unknown")}` +
+        (dep.commitUrl ? `  ${c(ANSI.dim, dep.commitUrl)}` : ""),
+    );
+  }
   lines.push(`Overall: ${tag(report.overall)}`);
 
   for (const section of report.sections) {
@@ -43,6 +57,9 @@ export const renderText = (report, opts = {}) => {
       const latency =
         check.latencyMs != null ? c(ANSI.dim, ` (${check.latencyMs}ms)`) : "";
       lines.push(`  ${tag(check.status)}  ${check.label}${latency}`);
+      if (check.description) {
+        lines.push(c(ANSI.dim, `      ${check.description}`));
+      }
       lines.push(c(ANSI.dim, `      ${check.target}`));
       lines.push(`      ${check.detail}`);
     }

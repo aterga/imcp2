@@ -217,6 +217,44 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         word-break: break-all;
       }
+      .deployment {
+        margin-top: 0.2rem;
+      }
+      .deployment code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .desc {
+        font-size: 0.83rem;
+        color: var(--muted);
+        margin: 0.3rem 0 0.4rem;
+      }
+      .tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin-bottom: 1rem;
+      }
+      .tab {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.45rem 0.8rem;
+        border: 1px solid var(--border);
+        border-radius: 0.6rem;
+        background: var(--card);
+        color: var(--text);
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .tab.active {
+        border-color: var(--accent);
+        box-shadow: inset 0 -2px 0 var(--accent);
+      }
+      .tab .count {
+        color: var(--muted);
+        font-weight: 500;
+      }
     </style>
   </head>
   <body>
@@ -249,64 +287,114 @@
 
       const badge = (status) =>
         `<span class="badge ${status}">${status}</span>`;
+      const dot = (status) => `<span class="dot ${status}"></span>`;
 
       function renderCheck(c) {
         const latency =
           c.latencyMs != null ? `<span class="latency">${c.latencyMs} ms</span>` : "";
+        const desc = c.description
+          ? `<div class="desc">${esc(c.description)}</div>`
+          : "";
         return `<div class="check">
           <div class="check-top">
-            <span class="dot ${c.status}"></span>
+            ${dot(c.status)}
             <span class="check-label">${esc(c.label)}</span>
             ${badge(c.status)}
             ${latency}
           </div>
+          ${desc}
           <div class="target">${esc(c.target)}</div>
           <div class="detail">${esc(c.detail)}</div>
           <div class="expected">expected: ${esc(c.expected)}</div>
         </div>`;
       }
 
-      function renderSection(s) {
-        return `<section class="card">
-          <div class="card-head">
-            <h2>${esc(s.title)}</h2>
-            ${badge(s.status)}
-          </div>
-          ${s.checks.map(renderCheck).join("")}
-        </section>`;
+      // Tabbed navigation: one tab per section plus a Suggestions tab. The active
+      // tab is remembered across refreshes and defaults to the first section that
+      // isn't passing, so problems surface without hunting through the tabs.
+      let lastReport = null;
+      let activeTab = null;
+
+      function deploymentHtml(dep) {
+        if (!dep || (!dep.version && !dep.commit)) return "";
+        const shortCommit =
+          dep.commit && dep.commit !== "unknown" ? dep.commit.slice(0, 7) : dep.commit;
+        const label = [dep.version ? "v" + dep.version : "", shortCommit]
+          .filter(Boolean)
+          .join(" @ ");
+        const inner = dep.commitUrl
+          ? `<a href="${esc(dep.commitUrl)}" target="_blank" rel="noopener noreferrer"><code>${esc(label)}</code></a>`
+          : `<code>${esc(label || "unknown")}</code>`;
+        return `<div class="deployment sub">Running deployment: ${inner}</div>`;
+      }
+
+      function renderPanel(report) {
+        if (activeTab === "suggestions") {
+          return `<section class="card">
+            <ul class="suggestions">${(report.suggestions || [])
+              .map((s) => `<li>${esc(s)}</li>`)
+              .join("")}</ul>
+          </section>`;
+        }
+        const sec = report.sections.find((s) => s.id === activeTab);
+        if (!sec) return "";
+        return `<section class="card">${sec.checks.map(renderCheck).join("")}</section>`;
       }
 
       function render(report) {
+        lastReport = report;
         const t = report.targets;
-        const parts = [];
-        parts.push(`<div class="overall">
-          <span class="dot ${report.overall}"></span>
-          <div>
-            <div><strong>Overall: </strong>${badge(report.overall)}</div>
-            <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code> &nbsp;·&nbsp; II: <code>${esc(t.iiOrigin || "(unresolved)")}</code></div>
-          </div>
-        </div>`);
-        for (const s of report.sections) parts.push(renderSection(s));
+
+        const tabs = report.sections.map((s) => ({
+          id: s.id,
+          title: s.title,
+          status: s.status,
+        }));
+        if (report.suggestions?.length) {
+          tabs.push({
+            id: "suggestions",
+            title: "Suggestions",
+            count: report.suggestions.length,
+          });
+        }
+        if (!tabs.some((x) => x.id === activeTab)) {
+          const firstBad = report.sections.find((s) => s.status !== "pass");
+          activeTab = firstBad ? firstBad.id : tabs[0] && tabs[0].id;
+        }
 
         const canister = report.facts?.ii?.canisterId;
-        if (canister) {
-          parts.push(
-            `<div class="facts">II frontend canister: ${esc(canister)}</div>`,
-          );
-        }
+        const parts = [];
+        parts.push(`<div class="overall">
+          ${dot(report.overall)}
+          <div>
+            <div><strong>Overall: </strong>${badge(report.overall)}</div>
+            <div class="sub">MCP: <code>${esc(t.mcpOrigin)}</code> &nbsp;·&nbsp; II: <code>${esc(t.iiOrigin || "(unresolved)")}</code>${canister ? ` &nbsp;·&nbsp; II canister: <code>${esc(canister)}</code>` : ""}</div>
+            ${deploymentHtml(report.deployment)}
+          </div>
+        </div>`);
 
-        if (report.suggestions?.length) {
-          parts.push(`<section class="card">
-            <div class="card-head"><h2>Suggestions</h2></div>
-            <ul class="suggestions">${report.suggestions
-              .map((s) => `<li>${esc(s)}</li>`)
-              .join("")}</ul>
-          </section>`);
-        }
+        parts.push(`<div class="tabs">${tabs
+          .map(
+            (x) =>
+              `<button class="tab ${x.id === activeTab ? "active" : ""}" data-tab="${esc(x.id)}">${x.status ? dot(x.status) : ""}<span>${esc(x.title)}</span>${x.status ? badge(x.status) : `<span class="count">(${x.count})</span>`}</button>`,
+          )
+          .join("")}</div>`);
+
+        parts.push(renderPanel(report));
+
         $("content").innerHTML = parts.join("");
         $("updated").textContent =
           "updated " + new Date(report.generatedAt).toLocaleTimeString();
       }
+
+      // Tab clicks re-render from the cached report (no refetch).
+      $("content").addEventListener("click", (e) => {
+        const tab = e.target.closest(".tab");
+        if (tab && lastReport) {
+          activeTab = tab.dataset.tab;
+          render(lastReport);
+        }
+      });
 
       let inFlight = false;
       async function load() {

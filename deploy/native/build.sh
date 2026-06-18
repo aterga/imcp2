@@ -14,11 +14,20 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-echo ">> building linux/arm64 binary (bullseye/glibc 2.31) -> build-out/mcp-poc"
+# Commit baked into the binary (surfaced at GET /version). Prefer an injected
+# GIT_SHA (CI passes github.sha); fall back to the local checkout, then "unknown".
+GIT_SHA="${GIT_SHA:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)}"
+
+echo ">> building linux/arm64 binary (bullseye/glibc 2.31) -> build-out/mcp-poc (commit ${GIT_SHA})"
 docker buildx build --platform linux/arm64 --target bin \
+  --build-arg GIT_SHA="$GIT_SHA" \
   --output type=local,dest=./build-out -f - . <<'DOCKERFILE'
 FROM --platform=linux/arm64 rust:1-slim-bullseye AS build
 WORKDIR /app
+# GIT_SHA is read by option_env!("GIT_SHA") in main.rs at compile time. Setting
+# it as an ENV (from the build-arg) makes a changed commit bust the cargo layer.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake clang libclang-dev perl pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*

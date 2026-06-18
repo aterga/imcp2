@@ -2,6 +2,10 @@
 # is prebuilt and committed, so no wasm toolchain is needed here.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /app
+# GIT_SHA is baked into the binary (option_env! in main.rs) and surfaced at
+# GET /version; pass it with --build-arg GIT_SHA=$(git rev-parse HEAD).
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # static/ is needed at build time too: main.rs/auth.rs include_str! the HTML pages.

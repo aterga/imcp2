@@ -7,21 +7,27 @@ Identity** instance it is paired with.
 It answers three questions and adds a few suggestions:
 
 1. **Is the server running and responding on all advertised endpoints with the
-   correct status codes?** — probes the landing page, the two OAuth discovery
-   documents, the `/mcp` endpoint's unauthenticated `401` challenge, dynamic
-   client registration, and the `/oauth/authorize` + `/oauth/token` endpoints,
-   plus TLS certificate freshness.
+   correct status codes?** — probes the landing page, the build/version endpoint
+   (`/version`), the two OAuth discovery documents, the `/mcp` endpoint's
+   unauthenticated `401` challenge, dynamic client registration, and the
+   `/oauth/authorize` + `/oauth/token` endpoints, plus TLS certificate freshness.
 2. **Which Internet Identity instance is it linked to?** — resolves the II
    origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention,
    overridable, and confirmed live via the `/oauth/authorize` redirect when the
    server exposes one).
 3. **Is that II instance healthy and does it recognise this MCP server?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
-   canister id and related origins, and verifies that the II's response CSP
-   `form-action` directive lists this MCP origin. That directive is derived
-   server-side from the II canister's `mcp_server_origin` config, so it is the
-   authoritative signal that the II trusts this MCP server and that the `/mcp`
-   delegation flow is enabled for it.
+   canister id and related origins, confirms it publishes its Candid config blob
+   at `/.config.did.bin`, and verifies that the II's response CSP `form-action`
+   directive lists this MCP origin. That directive is derived server-side from
+   the II canister's `mcp_server_origin` config, so it is the authoritative
+   signal that the II trusts this MCP server and that the `/mcp` delegation flow
+   is enabled for it.
+
+Every check carries a plain-language description, and the report shows which
+**deployment is running** — the MCP server's version and git commit (read from
+`GET /version`), linked to the commit on GitHub. The web dashboard groups the
+sections into **tabs** for easier navigation.
 
 ## Usage
 

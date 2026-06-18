@@ -706,6 +706,18 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
+        // Unauthenticated build/version probe: reports the running commit (baked
+        // in at build time via the GIT_SHA env var) so operators and the status
+        // dashboard can confirm exactly which deployment is live.
+        .route(
+            "/version",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
+                }))
+            }),
+        )
         .merge(signin)
         .merge(oauth)
         .merge(protected_mcp);

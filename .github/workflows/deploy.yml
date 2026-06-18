@@ -50,6 +50,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Cross-build arm64 binary
+        env:
+          GIT_SHA: ${{ github.sha }}
         run: deploy/native/build.sh
 
       - name: Configure SSH
