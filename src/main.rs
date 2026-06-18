@@ -575,6 +575,42 @@ async fn signin_confirm_submit(
         .into_response()
 }
 
+/// Log each inbound request: method, path, response status, and latency. Gives
+/// visibility into what external MCP clients probe (discovery URLs, unknown
+/// paths, etc.) at `RUST_LOG=info`. Secrets are kept out of logs: the query
+/// string is never logged (`?code=`/`?c=`), and the single-use `/signin/<link>`
+/// token in the path is redacted by [`sanitize_path`].
+async fn log_request(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = sanitize_path(req.uri().path());
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!(
+        %method,
+        %path,
+        status = resp.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "http request"
+    );
+    resp
+}
+
+/// Redact the single-use sign-in link token from `/signin/<link>` before logging
+/// (the link is an unguessable auth secret, consumed on first GET). The fixed
+/// sub-paths `/signin/callback` and `/signin/confirm` carry no path secret and
+/// are kept as-is.
+fn sanitize_path(path: &str) -> String {
+    match path.strip_prefix("/signin/") {
+        Some(rest) if !rest.is_empty() && rest != "callback" && rest != "confirm" => {
+            "/signin/<redacted>".to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -802,6 +838,19 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(auth::protected_resource_metadata),
         )
+        // Path-aware protected-resource metadata (RFC 9728 §3.1): the resource
+        // `…/mcp` has a path, so its metadata canonically lives at
+        // `/.well-known/oauth-protected-resource/mcp`. Clients that follow the
+        // `resource_metadata` hint use the root doc above; spec-strict clients
+        // derive this `/mcp`-suffixed URL. We deliberately do NOT add a
+        // `/mcp`-suffixed *authorization-server* doc: our AS issuer is `base_url()`
+        // (no path), so per RFC 8414 a strict client requesting the suffixed AS
+        // doc would reject it on issuer mismatch — the AS is correctly discovered
+        // at the root via `authorization_servers` in the protected-resource doc.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            axum::routing::get(auth::protected_resource_metadata),
+        )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
         .route("/oauth/nonce", axum::routing::get(auth::nonce))
         .route("/oauth/approve", axum::routing::post(auth::approve))
@@ -837,7 +886,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(signin)
         .merge(oauth)
-        .merge(protected_mcp);
+        .merge(protected_mcp)
+        // Log every inbound request (method, path, status, latency) so we can see
+        // what external clients actually hit — discovery probes, unknown paths,
+        // etc. Only the path is logged, never the query string, so single-use
+        // secrets (`?code=`, `?c=`) don't land in logs.
+        .layer(axum::middleware::from_fn(log_request));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -853,9 +907,24 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_bytes_with_did;
+    use super::{decode_bytes_with_did, sanitize_path};
     use candid::types::value::IDLArgs;
     use candid_parser::parse_idl_args;
+
+    // The single-use /signin/<link> token must be redacted from request logs,
+    // while the fixed sub-paths and all other routes log verbatim.
+    #[test]
+    fn sanitize_path_redacts_signin_link_only() {
+        assert_eq!(sanitize_path("/signin/abc123deadbeef"), "/signin/<redacted>");
+        // Fixed sub-paths carry no path secret and are kept.
+        assert_eq!(sanitize_path("/signin/callback"), "/signin/callback");
+        assert_eq!(sanitize_path("/signin/confirm"), "/signin/confirm");
+        // Unrelated routes are untouched.
+        assert_eq!(sanitize_path("/mcp"), "/mcp");
+        assert_eq!(sanitize_path("/oauth/token"), "/oauth/token");
+        assert_eq!(sanitize_path("/signin"), "/signin");
+        assert_eq!(sanitize_path("/"), "/");
+    }
 
     // Field names are hashed on the Candid wire; decoding against the method's
     // declared return type must recover them (type-less decoding shows hashes).
