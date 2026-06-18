@@ -16,6 +16,24 @@ export const DEFAULT_MCP_ORIGIN = "https://mcp.beta.id.ai";
 /** Per-probe network timeout in milliseconds. */
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
+/** GitHub repository the MCP server is built from (for commit links). */
+export const DEFAULT_REPO_URL = "https://github.com/aterga/imcp2";
+
+/** @returns {string} the repo base URL, overridable via MCP_STATUS_REPO_URL. */
+export const repoUrl = () =>
+  (process.env.MCP_STATUS_REPO_URL || DEFAULT_REPO_URL).replace(/\/+$/, "");
+
+/**
+ * Build a GitHub commit URL for a commit SHA, or undefined if the value is not
+ * a plausible SHA (e.g. "unknown" from a build with no commit injected).
+ * @param {string | undefined} commit
+ * @returns {string | undefined}
+ */
+export const commitUrl = (commit) =>
+  typeof commit === "string" && /^[0-9a-f]{7,40}$/i.test(commit)
+    ? `${repoUrl()}/commit/${commit}`
+    : undefined;
+
 /**
  * Host suffixes that may be probed. A hostname is allowed when it equals one of
  * these or ends with `.<suffix>`. The list can be extended for other

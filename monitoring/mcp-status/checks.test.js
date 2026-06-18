@@ -16,6 +16,7 @@ import {
   buildSuggestions,
 } from "./checks.js";
 import {
+  commitUrl,
   deriveIiOrigin,
   isAllowedOrigin,
   normaliseOrigin,
@@ -72,6 +73,16 @@ test("deriveIiOrigin strips the mcp. label", () => {
   assert.equal(deriveIiOrigin("https://example.com"), undefined);
 });
 
+test("commitUrl builds a GitHub link only for real SHAs", () => {
+  assert.equal(
+    commitUrl("abc123def4567890"),
+    "https://github.com/aterga/imcp2/commit/abc123def4567890",
+  );
+  assert.equal(commitUrl("unknown"), undefined);
+  assert.equal(commitUrl(undefined), undefined);
+  assert.equal(commitUrl(""), undefined);
+});
+
 test("normaliseOrigin rejects origins with a path", () => {
   assert.equal(normaliseOrigin("https://mcp.beta.id.ai/"), "https://mcp.beta.id.ai");
   assert.throws(() => normaliseOrigin("https://mcp.beta.id.ai/mcp"));
@@ -112,6 +123,15 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
     [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    [`GET ${origin}/version`]: resp(200, {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        version: "0.1.0",
+        commit: "abc123def4567890",
+        built_at: 1_700_000_000,
+        started_at: 1_700_000_500,
+      }),
+    }),
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -143,8 +163,9 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     }),
   });
   try {
-    const { section } = await checkMcpEndpoints(origin, 2000);
+    const { section, facts } = await checkMcpEndpoints(origin, 2000);
     assert.equal(byId(section, "root").status, "pass");
+    assert.equal(byId(section, "version").status, "pass");
     assert.equal(byId(section, "protected-resource").status, "pass");
     assert.equal(byId(section, "as-metadata").status, "pass");
     assert.equal(byId(section, "metadata-consistency").status, "pass");
@@ -152,6 +173,22 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     assert.equal(byId(section, "oauth-register").status, "pass");
     assert.equal(byId(section, "oauth-authorize").status, "pass");
     assert.equal(byId(section, "oauth-token").status, "pass");
+    // Deployment facts are captured and a GitHub commit link is derived.
+    assert.equal(facts.deployment.version, "0.1.0");
+    assert.equal(facts.deployment.commit, "abc123def4567890");
+    assert.equal(
+      facts.deployment.commitUrl,
+      "https://github.com/aterga/imcp2/commit/abc123def4567890",
+    );
+    assert.equal(facts.deployment.builtAt, 1_700_000_000);
+    assert.equal(facts.deployment.startedAt, 1_700_000_500);
+    // Every check carries a human-readable description.
+    for (const c of section.checks) {
+      assert.ok(
+        typeof c.description === "string" && c.description.length > 0,
+        `check ${c.id} is missing a description`,
+      );
+    }
   } finally {
     restore();
   }
@@ -161,6 +198,7 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   const origin = "https://mcp.beta.test";
   const restore = stubFetch({
     [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
+    [`GET ${origin}/version`]: resp(404),
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
       body: JSON.stringify({ authorization_servers: [origin], resource: `${origin}/mcp` }),
     }),
@@ -201,14 +239,24 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
         "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:* ${mcp};frame-ancestors 'self' ${ii} https://beta.identity.ic0.app`,
       },
     }),
+    [`GET ${ii}/.config.did.bin`]: resp(200, {
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-length": "20",
+      },
+      body: "DIDLbinaryconfigblob",
+    }),
   });
   try {
     const { section, facts } = await checkIiHealth(ii, mcp, 2000);
     assert.equal(byId(section, "ii-reachable").status, "pass");
     assert.equal(byId(section, "ii-certified").status, "pass");
     assert.equal(byId(section, "ii-recognises-mcp").status, "pass");
+    assert.equal(byId(section, "ii-config-did").status, "pass");
     assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
+    assert.equal(facts.configDid.status, 200);
+    assert.equal(facts.configDid.bytes, 20);
   } finally {
     restore();
   }
@@ -223,10 +271,12 @@ test("checkIiHealth fails recognition when MCP origin is absent", async () => {
         "content-security-policy": `form-action 'self' http://127.0.0.1:*`,
       },
     }),
+    [`GET ${ii}/.config.did.bin`]: resp(404),
   });
   try {
     const { section } = await checkIiHealth(ii, mcp, 2000);
     assert.equal(byId(section, "ii-recognises-mcp").status, "fail");
+    assert.equal(byId(section, "ii-config-did").status, "fail");
   } finally {
     restore();
   }
