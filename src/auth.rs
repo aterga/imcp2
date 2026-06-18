@@ -186,14 +186,16 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     // derivation origin and the caller-principal check). `ttl` is 60 minutes.
     let base = base_url();
     let callback = format!("{base}/oauth/connect/callback");
-    let ttl_ns: u64 = 60 * 60 * 1_000_000_000;
+    // II's `/mcp` reads `ttl` as MINUTES (it converts to ns canister-side), so
+    // send 60, not the nanosecond value.
+    let ttl_minutes: u64 = 60;
     let ii_mcp_url = format!(
         "{ii}/mcp#public_key={pk}&callback={cb}&state={st}&ttl={ttl}",
         ii = crate::identities::ii_url(),
         pk = urlencoding::encode(&pubkey_b64),
         cb = urlencoding::encode(&callback),
         st = urlencoding::encode(&connect_state),
-        ttl = ttl_ns,
+        ttl = ttl_minutes,
     );
     fragment_redirect(&ii_mcp_url)
 }
