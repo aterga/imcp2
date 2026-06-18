@@ -180,19 +180,19 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         },
     );
 
-    // II `/mcp` flow: backend public key out, delegation in. `app` is the MCP
-    // origin (so the delegation's principal = derive(anchor, mcp_origin), the
-    // caller II's account-delegation methods authorize); `ttl` is 60 minutes.
+    // II `/mcp` flow: backend public key out, delegation in. No `app` param —
+    // the connection is to the MCP server itself, whose origin II already knows
+    // from its own `mcp_server_origin` config (used both for the delegation's
+    // derivation origin and the caller-principal check). `ttl` is 60 minutes.
     let base = base_url();
     let callback = format!("{base}/oauth/connect/callback");
     let ttl_ns: u64 = 60 * 60 * 1_000_000_000;
     let ii_mcp_url = format!(
-        "{ii}/mcp#public_key={pk}&callback={cb}&state={st}&app={app}&ttl={ttl}",
+        "{ii}/mcp#public_key={pk}&callback={cb}&state={st}&ttl={ttl}",
         ii = crate::identities::ii_url(),
         pk = urlencoding::encode(&pubkey_b64),
         cb = urlencoding::encode(&callback),
         st = urlencoding::encode(&connect_state),
-        app = urlencoding::encode(&base),
         ttl = ttl_ns,
     );
     fragment_redirect(&ii_mcp_url)
