@@ -11,7 +11,9 @@ encoding/decoding (and, later, signing) against the IC via
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
+| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |
+| `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
+| `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `identity` | Reply as textual Candid, called as `anonymous` or a signed-in domain |
 | `list_identities` | `wait_for?` | `anonymous` + every signed-in domain (principal + validity); waits for a pending sign-in when `wait_for` is set |
@@ -22,6 +24,16 @@ encoding/decoding (and, later, signing) against the IC via
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
 backend candidates mined from `/env.json` + the JS bundle (pick by label, prefer
 production/`IC_` ids, confirm with `get_candid`).
+
+When the user names a **token, project, or service** (e.g. `ckUSDC`) rather than a
+website or id, `find_canister` resolves it via
+[`dashboard.internetcomputer.org`](https://dashboard.internetcomputer.org)'s public
+APIs — the ICRC token registry and the SNS catalog — to the matching canister id(s).
+`lookup_canister` goes the other way: given a bare id, it returns the dashboard's
+label, type, controllers, subnet, and module hash, so a raw principal becomes an
+identified service. (`discover_canisters` results are annotated with these labels
+inline.) There is no public name-search over arbitrary canisters, so `find_canister`
+covers the IC's labelled services, which is where the meaningful ones live.
 
 `call_canister` runs as `identity` — `anonymous` by default, or a domain you've
 signed into. `sign_in(domain)` returns a URL the user opens; after they approve
