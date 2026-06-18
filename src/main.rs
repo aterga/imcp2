@@ -172,12 +172,9 @@ impl IcTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        let arg_bytes = match candid_parser::parse_idl_args(&args) {
-            Ok(parsed) => match parsed.to_bytes() {
-                Ok(b) => b,
-                Err(e) => return Ok(err(format!("could not encode args `{args}`: {e}"))),
-            },
-            Err(e) => return Ok(err(format!("could not parse args `{args}`: {e}"))),
+        let arg_bytes = match self.encode_args(principal, &method, &args).await {
+            Ok(b) => b,
+            Err(e) => return Ok(err(e)),
         };
 
         // Pick the agent: no domain uses the shared anonymous agent; a domain
@@ -289,13 +286,47 @@ impl IcTools {
         method: &str,
         bytes: &[u8],
     ) -> Option<String> {
+        let did = self.candid_service(canister).await?;
+        decode_bytes_with_did(&did, method, bytes)
+    }
+
+    /// The canister's `candid:service` interface (`.did` text), if exposed.
+    async fn candid_service(&self, canister: Principal) -> Option<String> {
         let raw = self
             .agent
             .read_state_canister_metadata(canister, "candid:service")
             .await
             .ok()?;
-        let did = String::from_utf8(raw).ok()?;
-        decode_bytes_with_did(&did, method, bytes)
+        String::from_utf8(raw).ok()
+    }
+
+    /// Encode textual Candid args to bytes. Prefer the method's declared
+    /// parameter types from the canister's interface, so plain literals coerce to
+    /// what the method expects (e.g. `42` -> `nat64`, `1` -> `float64`, `opt`/
+    /// `vec` element types) and no `: type` annotations are needed. Fall back to
+    /// type-less inference only when the interface can't be read (then numeric
+    /// literals default to `int`/`float64` and must be annotated — see the
+    /// `candid://textual-syntax` resource).
+    async fn encode_args(
+        &self,
+        canister: Principal,
+        method: &str,
+        args_text: &str,
+    ) -> Result<Vec<u8>, String> {
+        let parsed = candid_parser::parse_idl_args(args_text)
+            .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
+        if let Some(did) = self.candid_service(canister).await {
+            if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(&did).load() {
+                if let Ok(func) = env.get_method(&actor, method) {
+                    return parsed
+                        .to_bytes_with_types(&env, &func.args)
+                        .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
+                }
+            }
+        }
+        parsed
+            .to_bytes()
+            .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
     }
 }
 

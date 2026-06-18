@@ -11,6 +11,37 @@ Quick reminders:
 - `opt`: `null` or `opt <v>`. `vec`: `vec { a; b }`. Blobs: `blob "\CA\FF"`.
 - Annotate numeric types when they matter: `5 : nat64`, `-1 : int8`.
 
+## Encoding & footguns
+
+`call_canister` encodes your args **against the method's declared Candid types**
+whenever it can read the canister's interface — so plain literals coerce to what
+the method expects (`42` → `nat64`, `1` → `float64`, the right `opt`/`vec`
+element types, etc.) and you usually **don't** need `: type` annotations.
+
+Annotations and the footguns below only bite in the **fallback**: when the
+canister's `candid:service` interface can't be read (access-restricted), args
+are encoded by *inference from the literals alone*. In that mode:
+
+- **Numbers default to `int` (whole) and `float64` (decimal).** A bare `42`
+  encodes as `int`, not `nat`/`nat64`/…; a bare `1.5` as `float64`, not
+  `float32`. Annotate the exact type: `42 : nat`, `42 : nat64`, `-1 : int8`,
+  `1.5 : float32`. (`int` and `nat` are *different* wire types — a `nat`
+  parameter rejects an `int`.)
+- **A whole number is never a float by default.** For a `float64` field write
+  `1.0` or `1 : float64`, not `1`.
+- **`opt` is not auto-wrapped.** For `opt t` write `opt <v>` (Some) or `null`
+  (None) — a bare `5` is `int`, not `opt nat`.
+- **Empty/ambiguous `vec` needs a type.** `vec {}` has no element type to infer;
+  annotate `vec {} : vec nat8`. Byte arrays: prefer `blob "…"`, or
+  `vec { 1 : nat8; 2 : nat8 }`.
+- **Keywords, not bare strings:** `principal "aaaaa-aa"`, `func "…".m`,
+  `service : "…"` — a quoted string alone is `text`.
+- **Variants take exactly one tag;** a payload-less case is `variant { Tag }`.
+- **Tuple records are positional:** `record { a; b }` ≡ fields `0 = a; 1 = b`.
+
+When in doubt, annotate — an explicit `: type` is always safe and matches in
+both modes.
+
 ---
 
 ### text
