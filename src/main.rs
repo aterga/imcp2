@@ -502,26 +502,40 @@ async fn signin_confirm_submit(
         .into_response()
 }
 
-/// Log each inbound request: method, path (no query string — avoids leaking
-/// single-use `?code=`/`?c=` secrets), response status, and latency. Gives
+/// Log each inbound request: method, path, response status, and latency. Gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
-/// paths, etc.) at `RUST_LOG=info`.
+/// paths, etc.) at `RUST_LOG=info`. Secrets are kept out of logs: the query
+/// string is never logged (`?code=`/`?c=`), and the single-use `/signin/<link>`
+/// token in the path is redacted by [`sanitize_path`].
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let path = sanitize_path(req.uri().path());
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
     tracing::info!(
         %method,
-        path = %path,
+        %path,
         status = resp.status().as_u16(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "http request"
     );
     resp
+}
+
+/// Redact the single-use sign-in link token from `/signin/<link>` before logging
+/// (the link is an unguessable auth secret, consumed on first GET). The fixed
+/// sub-paths `/signin/callback` and `/signin/confirm` carry no path secret and
+/// are kept as-is.
+fn sanitize_path(path: &str) -> String {
+    match path.strip_prefix("/signin/") {
+        Some(rest) if !rest.is_empty() && rest != "callback" && rest != "confirm" => {
+            "/signin/<redacted>".to_string()
+        }
+        _ => path.to_string(),
+    }
 }
 
 fn html_escape(s: &str) -> String {
