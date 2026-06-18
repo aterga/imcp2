@@ -239,12 +239,9 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
         "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:* ${mcp};frame-ancestors 'self' ${ii} https://beta.identity.ic0.app`,
       },
     }),
-    [`GET ${ii}/.config.did.bin`]: resp(200, {
-      headers: {
-        "content-type": "application/octet-stream",
-        "content-length": "20",
-      },
-      body: "DIDLbinaryconfigblob",
+    [`GET ${ii}/.config`]: resp(200, {
+      headers: { "content-type": "text/plain" },
+      body: `record {\n  backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai";\n  related_origins = opt vec { "${ii}"; };\n  mcp_server_origin = opt "${mcp}";\n}`,
     }),
   });
   try {
@@ -252,11 +249,12 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
     assert.equal(byId(section, "ii-reachable").status, "pass");
     assert.equal(byId(section, "ii-certified").status, "pass");
     assert.equal(byId(section, "ii-recognises-mcp").status, "pass");
-    assert.equal(byId(section, "ii-config-did").status, "pass");
+    assert.equal(byId(section, "ii-config").status, "pass");
+    assert.equal(byId(section, "ii-config-mcp-origin").status, "pass");
     assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
-    assert.equal(facts.configDid.status, 200);
-    assert.equal(facts.configDid.bytes, 20);
+    assert.equal(facts.config.status, 200);
+    assert.equal(facts.config.mcpServerOrigin, mcp);
   } finally {
     restore();
   }
@@ -271,12 +269,14 @@ test("checkIiHealth fails recognition when MCP origin is absent", async () => {
         "content-security-policy": `form-action 'self' http://127.0.0.1:*`,
       },
     }),
-    [`GET ${ii}/.config.did.bin`]: resp(404),
+    [`GET ${ii}/.config`]: resp(404),
   });
   try {
     const { section } = await checkIiHealth(ii, mcp, 2000);
     assert.equal(byId(section, "ii-recognises-mcp").status, "fail");
-    assert.equal(byId(section, "ii-config-did").status, "fail");
+    assert.equal(byId(section, "ii-config").status, "fail");
+    // No config served → mcp_server_origin can't be read → informational warn.
+    assert.equal(byId(section, "ii-config-mcp-origin").status, "warn");
   } finally {
     restore();
   }

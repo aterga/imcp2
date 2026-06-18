@@ -56,13 +56,19 @@ const defaults = {
 // for a short TTL and coalesce concurrent requests into a single in-flight run.
 const ttlEnv = Number(process.env.MCP_STATUS_CACHE_TTL_MS);
 const CACHE_TTL_MS = Number.isFinite(ttlEnv) && ttlEnv > 0 ? ttlEnv : 15_000;
+// An explicit refresh (`?fresh=1`) bypasses the TTL so the button feels live,
+// but never re-probes more often than this floor — so it can't be used to hammer
+// the monitored server (each run includes a dynamic client registration).
+const FORCE_MIN_AGE_MS = 2_000;
 /** @type {{ at: number, report: import("./checks.js").DashboardReport | null }} */
 let cache = { at: 0, report: null };
 /** @type {Promise<import("./checks.js").DashboardReport> | null} */
 let inFlight = null;
 
-const getReport = () => {
-  if (cache.report && Date.now() - cache.at < CACHE_TTL_MS) {
+/** @param {boolean} [force] bypass the normal TTL (still rate-floored + coalesced). */
+const getReport = (force = false) => {
+  const maxAge = force ? FORCE_MIN_AGE_MS : CACHE_TTL_MS;
+  if (cache.report && Date.now() - cache.at < maxAge) {
     return Promise.resolve(cache.report);
   }
   if (!inFlight) {
@@ -116,7 +122,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/status") {
-      const report = await getReport();
+      // `?fresh=1` only controls caching, never the probe target, so it does not
+      // widen the SSRF surface (the target stays fixed at startup).
+      const force = url.searchParams.get("fresh") === "1";
+      const report = await getReport(force);
       sendJson(res, report.overall === "fail" ? 503 : 200, report);
       return;
     }

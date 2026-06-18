@@ -424,33 +424,41 @@
       });
 
       let inFlight = false;
-      async function load() {
+      // `force` is set for an explicit Refresh click: it adds ?fresh=1 so the
+      // server re-probes past its short cache (otherwise a refresh within the
+      // cache window returns identical data and looks like nothing happened).
+      async function load(force) {
         if (inFlight) return;
         inFlight = true;
-        $("refresh").disabled = true;
+        const btn = $("refresh");
+        btn.disabled = true;
+        btn.textContent = "Refreshing…";
         try {
           // Targets are fixed by the server at startup (the server does not
-          // accept per-request targets), so no query parameters are sent.
+          // accept per-request targets), so no target params are sent.
           // Path-relative so the dashboard works both at the site root and
           // when mounted under a sub-path (e.g. behind Caddy at /status/).
-          const res = await fetch("api/status");
+          const res = await fetch("api/status" + (force ? "?fresh=1" : ""), {
+            cache: "no-store",
+          });
           render(await res.json());
         } catch (e) {
           $("content").innerHTML =
             `<p class="error">Failed to load status: ${esc(e.message)}</p>`;
         } finally {
           inFlight = false;
-          $("refresh").disabled = false;
+          btn.disabled = false;
+          btn.textContent = "Refresh";
         }
       }
 
       let timer = null;
       function syncTimer() {
         if (timer) clearInterval(timer);
-        if ($("auto").checked) timer = setInterval(load, 30_000);
+        if ($("auto").checked) timer = setInterval(() => load(), 30_000);
       }
 
-      $("refresh").addEventListener("click", load);
+      $("refresh").addEventListener("click", () => load(true));
       $("auto").addEventListener("change", syncTimer);
       syncTimer();
       load();
