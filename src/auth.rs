@@ -65,7 +65,15 @@ fn load_clients() -> HashMap<String, ClientReg> {
             tracing::warn!("could not parse {}: {e}; starting with no clients", clients_file());
             HashMap::new()
         }),
-        Err(_) => HashMap::new(),
+        // No file yet (first run) is normal and silent; a real read error
+        // (permissions, EIO) is logged loudly — it silently drops previously
+        // issued client_ids, so it must be diagnosable — but we still start
+        // (clients can re-register) rather than refuse to boot.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            tracing::warn!("could not read {}: {e}; starting with no clients", clients_file());
+            HashMap::new()
+        }
     }
 }
 
@@ -383,17 +391,21 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     Json(body).into_response()
 }
 
-/// `http://<loopback>[:port][/path]`, host matched exactly. A bare `starts_with`
-/// would also accept `http://localhost.evil.com/...` or `http://localhost@evil`,
-/// so require the host to end at a `:` (port), `/` (path), or end of string.
+/// An `http://` loopback redirect (any port), matched on the parsed **host** so
+/// look-alikes can't slip through. Parsing (not `strip_prefix`) is what defends
+/// against authority tricks: `http://localhost.evil.com`, `http://localhost@evil.com`,
+/// and the userinfo-with-port form `http://localhost:1234@evil.com` all parse to
+/// host `evil.com` (or carry userinfo) and are rejected. Userinfo is rejected
+/// outright since a legitimate loopback callback never carries credentials.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
-    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-        .iter()
-        .any(|host| {
-            redirect_uri
-                .strip_prefix(host)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
-        })
+    let Ok(url) = url::Url::parse(redirect_uri) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        // host_str() serializes an IPv6 host with brackets ("[::1]").
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -416,7 +428,10 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uris required");
     }
     let client_id = format!("client-{}", Uuid::new_v4());
-    {
+    // Insert under the lock, then persist a snapshot off the lock (and off the
+    // async runtime thread) so disk I/O never blocks readers like
+    // `/oauth/authorize`. Registration is infrequent, so the clone is cheap.
+    let snapshot = {
         let mut clients = store.clients.write().await;
         clients.insert(
             client_id.clone(),
@@ -424,8 +439,11 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
                 redirect_uris: req.redirect_uris.clone(),
             },
         );
-        persist_clients(&clients);
-    }
+        clients.clone()
+    };
+    tokio::task::spawn_blocking(move || persist_clients(&snapshot))
+        .await
+        .ok();
 
     // Public client (PKCE, no secret): build the response by hand and OMIT
     // client_secret entirely. Returning client_secret: null breaks clients that
@@ -560,14 +578,21 @@ mod tests {
         assert!(redirect_allowed(None, "http://[::1]:8080/cb"));
     }
 
-    /// Loopback matching binds the host (no `starts_with` confusion).
+    /// Loopback matching is on the parsed host, so authority tricks (suffix,
+    /// userinfo, userinfo-with-port) can't redirect a code off-box.
     #[test]
     fn loopback_rejects_lookalikes() {
         assert!(is_loopback_redirect("http://127.0.0.1:51000/callback"));
         assert!(is_loopback_redirect("http://localhost/cb"));
+        assert!(is_loopback_redirect("http://[::1]:8080/cb"));
         assert!(!is_loopback_redirect("http://localhost.evil.com/cb"));
         assert!(!is_loopback_redirect("http://127.0.0.1.evil.com/cb"));
         assert!(!is_loopback_redirect("http://localhost@evil.com/cb"));
+        // userinfo-with-port bypass: real host is evil.com.
+        assert!(!is_loopback_redirect("http://localhost:1234@evil.com/cb"));
+        assert!(!is_loopback_redirect("http://127.0.0.1:5000@evil.com/cb"));
+        // https is not a loopback scheme; credentials never belong on a callback.
+        assert!(!is_loopback_redirect("https://localhost/cb"));
         assert!(!is_loopback_redirect("https://evil.com/cb"));
     }
 }
