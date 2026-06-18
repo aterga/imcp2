@@ -502,6 +502,28 @@ async fn signin_confirm_submit(
         .into_response()
 }
 
+/// Log each inbound request: method, path (no query string — avoids leaking
+/// single-use `?code=`/`?c=` secrets), response status, and latency. Gives
+/// visibility into what external MCP clients probe (discovery URLs, unknown
+/// paths, etc.) at `RUST_LOG=info`.
+async fn log_request(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!(
+        %method,
+        path = %path,
+        status = resp.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "http request"
+    );
+    resp
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -696,6 +718,18 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(auth::protected_resource_metadata),
         )
+        // Path-aware discovery locations (RFC 9728 §3.1 / RFC 8414): a resource at
+        // `…/mcp` has its metadata at `/.well-known/<doc>/mcp`. Clients vary —
+        // Claude/ChatGPT follow the `resource_metadata` hint (the root doc above),
+        // but spec-strict clients derive the `/mcp`-suffixed URL. Serve both.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            axum::routing::get(auth::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            axum::routing::get(auth::authorization_server_metadata),
+        )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
         .route("/oauth/nonce", axum::routing::get(auth::nonce))
         .route("/oauth/approve", axum::routing::post(auth::approve))
@@ -708,7 +742,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
         .merge(signin)
         .merge(oauth)
-        .merge(protected_mcp);
+        .merge(protected_mcp)
+        // Log every inbound request (method, path, status, latency) so we can see
+        // what external clients actually hit — discovery probes, unknown paths,
+        // etc. Only the path is logged, never the query string, so single-use
+        // secrets (`?code=`, `?c=`) don't land in logs.
+        .layer(axum::middleware::from_fn(log_request));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
