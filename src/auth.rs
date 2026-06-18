@@ -25,8 +25,7 @@ use axum::{
     Form,
 };
 use base64::Engine;
-use rmcp::transport::auth::OAuthClientConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -44,9 +43,56 @@ pub fn base_url() -> String {
     std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:8000".to_string())
 }
 
+/// A registered OAuth client (RFC 7591): the redirect URIs it declared. The
+/// authorize flow only redirects a code to one of these (exact match), so the
+/// server is not an open redirector and needs no hardcoded host allowlist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientReg {
+    redirect_uris: Vec<String>,
+}
+
+/// File the dynamic client registrations are persisted to. RFC 7591 clients are
+/// long-lived (they cache their `client_id`), so registrations must survive a
+/// restart — unlike codes/tokens/sessions, which are short-lived and stay in
+/// memory. Override with `OAUTH_CLIENTS_FILE`.
+fn clients_file() -> String {
+    std::env::var("OAUTH_CLIENTS_FILE").unwrap_or_else(|_| "oauth-clients.json".to_string())
+}
+
+fn load_clients() -> HashMap<String, ClientReg> {
+    match std::fs::read(clients_file()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("could not parse {}: {e}; starting with no clients", clients_file());
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Best-effort write-through of the registration store. A failure (e.g. a
+/// read-only filesystem) only means registrations don't survive a restart — the
+/// client re-registers — so log and carry on.
+fn persist_clients(clients: &HashMap<String, ClientReg>) {
+    match serde_json::to_vec_pretty(clients) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(clients_file(), bytes) {
+                tracing::warn!("could not persist {}: {e}", clients_file());
+            }
+        }
+        Err(e) => tracing::warn!("could not serialize client registrations: {e}"),
+    }
+}
+
+/// Acceptance rule for a redirect: loopback (any port, RFC 8252 §7.3) or a URI
+/// the client registered (exact match, OAuth 2.1).
+fn redirect_allowed(reg: Option<&ClientReg>, redirect_uri: &str) -> bool {
+    is_loopback_redirect(redirect_uri)
+        || reg.is_some_and(|c| c.redirect_uris.iter().any(|u| u == redirect_uri))
+}
+
 #[derive(Clone)]
 pub struct AuthStore {
-    clients: Arc<RwLock<HashMap<String, OAuthClientConfig>>>,
+    clients: Arc<RwLock<HashMap<String, ClientReg>>>,
     codes: Arc<RwLock<HashMap<String, CodeGrant>>>,
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
     /// Pending connects keyed by the single-use `state` carried through II's
@@ -97,7 +143,7 @@ struct TokenInfo {
 impl AuthStore {
     pub fn new(identities: Identities) -> Self {
         Self {
-            clients: Arc::default(),
+            clients: Arc::new(RwLock::new(load_clients())),
             codes: Arc::default(),
             tokens: Arc::default(),
             connects: Arc::default(),
@@ -105,25 +151,15 @@ impl AuthStore {
         }
     }
 
-    /// Accept a client for the OAuth flow, lazily recording it if unseen.
-    ///
-    /// PoC stance: client registration is ceremonial here — the real auth is the
-    /// verified II delegation plus PKCE, not the client's identity. Accepting
-    /// any client_id (rather than requiring it to be pre-registered) keeps the
-    /// flow working across server restarts, where Claude Code reuses a cached
-    /// dynamically-registered client_id against the in-memory store. The
-    /// redirect_uri is still restricted to loopback plus the ChatGPT and
-    /// Claude.ai hosted connector OAuth callbacks to avoid an open redirector.
+    /// Whether `redirect_uri` is acceptable for `client_id`. Per OAuth 2.1 the
+    /// redirect must be one the client registered via DCR (exact match) — that,
+    /// not a hardcoded host list, is what keeps the server from being an open
+    /// redirector and lets any registration-compliant client (Claude, ChatGPT,
+    /// Grok, …) connect without code changes. Loopback is the one exception
+    /// (RFC 8252 §7.3): native clients bind an ephemeral port at runtime, so
+    /// any-port loopback is accepted regardless of the registered port.
     async fn validate_client(&self, client_id: &str, redirect_uri: &str) -> bool {
-        if !is_allowed_redirect(redirect_uri) {
-            return false;
-        }
-        self.clients
-            .write()
-            .await
-            .entry(client_id.to_string())
-            .or_insert_with(|| OAuthClientConfig::new(client_id.to_string(), redirect_uri.to_string()));
-        true
+        redirect_allowed(self.clients.read().await.get(client_id), redirect_uri)
     }
 
     /// The verified principal + session id behind a bearer token, if valid.
@@ -347,19 +383,6 @@ pub async fn token(State(store): State<AuthStore>, Form(req): Form<TokenForm>) -
     Json(body).into_response()
 }
 
-/// Allowed redirect targets: loopback (accept any port — OAuth clients like
-/// Claude Code pick an ephemeral localhost callback port), ChatGPT's connector
-/// OAuth callbacks, and Claude.ai's hosted connector callback (Claude.ai web,
-/// Desktop, mobile, Cowork). Reject anything else to avoid an open redirector
-/// (`approve()` builds its redirect from this URI).
-fn is_allowed_redirect(redirect_uri: &str) -> bool {
-    // The trailing `/` on the ChatGPT prefix and the exact Claude.ai match bind
-    // the host; the loopback hosts need an explicit boundary check (see below).
-    is_loopback_redirect(redirect_uri)
-        || redirect_uri.starts_with("https://chatgpt.com/connector/oauth/")
-        || redirect_uri == "https://claude.ai/api/mcp/auth_callback"
-}
-
 /// `http://<loopback>[:port][/path]`, host matched exactly. A bare `starts_with`
 /// would also accept `http://localhost.evil.com/...` or `http://localhost@evil`,
 /// so require the host to end at a `:` (port), `/` (path), or end of string.
@@ -393,8 +416,16 @@ pub async fn register(State(store): State<AuthStore>, Json(req): Json<RegisterRe
         return oauth_err(StatusCode::BAD_REQUEST, "invalid_request", "redirect_uris required");
     }
     let client_id = format!("client-{}", Uuid::new_v4());
-    let client = OAuthClientConfig::new(client_id.clone(), req.redirect_uris[0].clone());
-    store.clients.write().await.insert(client_id.clone(), client);
+    {
+        let mut clients = store.clients.write().await;
+        clients.insert(
+            client_id.clone(),
+            ClientReg {
+                redirect_uris: req.redirect_uris.clone(),
+            },
+        );
+        persist_clients(&clients);
+    }
 
     // Public client (PKCE, no secret): build the response by hand and OMIT
     // client_secret entirely. Returning client_secret: null breaks clients that
@@ -498,7 +529,7 @@ pub type _JsonValue = Value;
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_redirect, pkce_s256};
+    use super::{is_loopback_redirect, pkce_s256, redirect_allowed, ClientReg};
 
     /// RFC 7636 Appendix B test vector.
     #[test]
@@ -509,26 +540,34 @@ mod tests {
     }
 
     #[test]
-    fn redirect_allowlist_accepts_known_clients() {
-        // Loopback, any port / path (Claude Code picks an ephemeral port).
-        assert!(is_allowed_redirect("http://localhost:1234/cb"));
-        assert!(is_allowed_redirect("http://127.0.0.1:51000/callback"));
-        assert!(is_allowed_redirect("http://[::1]:8080/cb"));
-        assert!(is_allowed_redirect("http://localhost/cb"));
-        // Hosted connector callbacks.
-        assert!(is_allowed_redirect("https://chatgpt.com/connector/oauth/Os40vV-QKzE1"));
-        assert!(is_allowed_redirect("https://claude.ai/api/mcp/auth_callback"));
+    fn redirect_requires_registration_or_loopback() {
+        let reg = ClientReg {
+            redirect_uris: vec![
+                "https://grok.com/connector/oauth/cb".to_string(),
+                "https://claude.ai/api/mcp/auth_callback".to_string(),
+            ],
+        };
+        // A hosted redirect is accepted iff this client registered it (exact).
+        assert!(redirect_allowed(Some(&reg), "https://grok.com/connector/oauth/cb"));
+        assert!(redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback"));
+        assert!(!redirect_allowed(Some(&reg), "https://grok.com/connector/oauth/other"));
+        assert!(!redirect_allowed(Some(&reg), "https://claude.ai/api/mcp/auth_callback/x"));
+        // An unregistered / unknown client can't use a hosted redirect.
+        assert!(!redirect_allowed(None, "https://grok.com/connector/oauth/cb"));
+        // Loopback (RFC 8252) is accepted at any port, even unregistered.
+        assert!(redirect_allowed(None, "http://127.0.0.1:51000/callback"));
+        assert!(redirect_allowed(None, "http://localhost:1234/cb"));
+        assert!(redirect_allowed(None, "http://[::1]:8080/cb"));
     }
 
+    /// Loopback matching binds the host (no `starts_with` confusion).
     #[test]
-    fn redirect_allowlist_rejects_lookalikes() {
-        // Host-confusion variants must not pass (no open redirector).
-        assert!(!is_allowed_redirect("http://localhost.evil.com/cb"));
-        assert!(!is_allowed_redirect("http://127.0.0.1.evil.com/cb"));
-        assert!(!is_allowed_redirect("http://localhost@evil.com/cb"));
-        assert!(!is_allowed_redirect("https://chatgpt.com.evil.com/connector/oauth/x"));
-        assert!(!is_allowed_redirect("https://chatgpt.com:444/connector/oauth/x"));
-        assert!(!is_allowed_redirect("https://claude.ai/api/mcp/auth_callback/extra"));
-        assert!(!is_allowed_redirect("https://evil.com/cb"));
+    fn loopback_rejects_lookalikes() {
+        assert!(is_loopback_redirect("http://127.0.0.1:51000/callback"));
+        assert!(is_loopback_redirect("http://localhost/cb"));
+        assert!(!is_loopback_redirect("http://localhost.evil.com/cb"));
+        assert!(!is_loopback_redirect("http://127.0.0.1.evil.com/cb"));
+        assert!(!is_loopback_redirect("http://localhost@evil.com/cb"));
+        assert!(!is_loopback_redirect("https://evil.com/cb"));
     }
 }

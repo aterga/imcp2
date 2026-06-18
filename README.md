@@ -109,7 +109,9 @@ Endpoints:
 
 - `GET /.well-known/oauth-authorization-server` — AS metadata
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
-- `POST /oauth/register` — dynamic client registration
+- `POST /oauth/register` — dynamic client registration (RFC 7591); the client's
+  `redirect_uris` are stored (persisted to `OAUTH_CLIENTS_FILE`) and bound to the
+  issued `client_id`
 - `GET  /oauth/authorize` — mints the connection's backend key and redirects the
   browser to II's `/mcp` flow, sending the backend **public** key
 - `POST /oauth/connect/callback` — II form-POSTs the delegation chain here; the
@@ -118,6 +120,13 @@ Endpoints:
 
 Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
 pointing at the resource metadata, as the MCP spec expects.
+
+**Redirect validation is per-client, not a host allowlist.** `/oauth/authorize`
+accepts a `redirect_uri` only if the requesting `client_id` registered it (exact
+match, OAuth 2.1) — so any registration-compliant client (Claude, ChatGPT, Grok,
+…) works without code changes, and the server can't be steered to an
+unregistered URL. The one exception is loopback (`http://127.0.0.1|localhost|[::1]`,
+any port) per RFC 8252, for native clients that bind an ephemeral callback port.
 
 **No private key is ever transmitted.** The backend generates a per-connection
 Ed25519 key and sends only its **public** key to II. II logs the user in and
