@@ -428,22 +428,48 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
 /// Log each inbound request: method, path, response status, and latency — gives
 /// visibility into what external MCP clients probe (discovery URLs, unknown
 /// paths) at `RUST_LOG=info`. The query string is never logged, keeping the
-/// OAuth `?code=` out of logs.
+/// OAuth `?code=` out of logs. The one exception is `/oauth/authorize`, where
+/// the query KEY names (never values) are logged as `authorize_query_keys` to
+/// diagnose connector-client compatibility (e.g. a missing required
+/// `redirect_uri`).
 async fn log_request(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // For /oauth/authorize only, capture which query KEYS the client sent (names
+    // only, never values). `<none>` distinguishes an absent/empty query from a
+    // request that did carry params.
+    let authorize_keys = (path == "/oauth/authorize").then(|| {
+        let keys: Vec<&str> = req
+            .uri()
+            .query()
+            .map(|q| {
+                q.split('&')
+                    .filter_map(|kv| kv.split('=').next())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if keys.is_empty() {
+            "<none>".to_string()
+        } else {
+            keys.join(",")
+        }
+    });
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
-    tracing::info!(
-        %method,
-        %path,
-        status = resp.status().as_u16(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "http request"
-    );
+    let status = resp.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // Attach `authorize_query_keys` only for /oauth/authorize, so it doesn't add
+    // an empty field to every other log line.
+    match authorize_keys {
+        Some(keys) => {
+            tracing::info!(%method, %path, status, elapsed_ms, authorize_query_keys = %keys, "http request")
+        }
+        None => tracing::info!(%method, %path, status, elapsed_ms, "http request"),
+    }
     resp
 }
 
