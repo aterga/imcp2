@@ -32,7 +32,7 @@ use ic_agent::{
     Agent, Identity,
 };
 use serde::Deserialize;
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::RwLock;
 
 /// Public IC API boundary node the II canister calls are made against.
 const IC_URL: &str = "https://icp-api.io";
@@ -45,13 +45,16 @@ const APP_DELEGATION_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
 /// call never goes out with an about-to-expire delegation.
 const REDERIVE_MARGIN_NS: u64 = 30 * 1_000_000_000;
 
-/// The single Internet Identity instance, source-of-truth `II_URL`. Default:
-/// **`beta.id.ai`**. A real domain is required: the raw `<canister>.icp0.io`
-/// origin is rate-limited (HTTP 429) for the browser login SPA, leaving the II
-/// popup blank. The same instance serves the connect-time `/mcp` delegation flow
-/// (browser) *and* the on-demand account-delegation methods (canister calls);
-/// its canister id is derived from `II_URL` (see [`ii_canister_id`]).
+/// Internet Identity instance, single source of truth. Default: **`beta.id.ai`**.
+/// A real domain is required: the raw `<canister>.icp0.io` origin is rate-limited
+/// (HTTP 429) for the browser login SPA, leaving the II popup blank. Used for the
+/// connect-time `/mcp` delegation flow (browser). Override with `II_URL`.
 const II_URL_DEFAULT: &str = "https://beta.id.ai";
+
+/// Canister id of that same II instance, used for the on-demand
+/// account-delegation calls (`mcp_*_account_delegation`). Default is the
+/// `beta.id.ai` canister. Override with `II_CANISTER_ID`.
+const II_CANISTER_ID_DEFAULT: &str = "fgte5-ciaaa-aaaad-aaatq-cai";
 
 /// Origin of the II instance (no trailing slash). Override with `II_URL`.
 pub fn ii_url() -> String {
@@ -59,49 +62,10 @@ pub fn ii_url() -> String {
     raw.trim_end_matches('/').to_string()
 }
 
-/// The II canister id, resolved once from the single `II_URL` (cached):
-///   1. `II_CANISTER_ID` env override, if set;
-///   2. the canister id embedded in the host (e.g. `<id>.icp0.io`/`.ic0.app`);
-///   3. otherwise (a custom domain like `beta.id.ai`) the authoritative
-///      `x-ic-canister-id` header the IC gateway returns for `II_URL`.
-async fn ii_canister_id() -> Result<Principal, String> {
-    static II_CANISTER: OnceCell<Principal> = OnceCell::const_new();
-    II_CANISTER
-        .get_or_try_init(resolve_ii_canister_id)
-        .await
-        .copied()
-}
-
-async fn resolve_ii_canister_id() -> Result<Principal, String> {
-    if let Ok(raw) = std::env::var("II_CANISTER_ID") {
-        return Principal::from_text(&raw).map_err(|e| format!("invalid II_CANISTER_ID '{raw}': {e}"));
-    }
-    let url = ii_url();
-    let host = url
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap_or("");
-    // A canister-id host label (e.g. `<id>.icp0.io`) is authoritative on its own.
-    if let Some(label) = host.split('.').next() {
-        if let Ok(p) = Principal::from_text(label) {
-            return Ok(p);
-        }
-    }
-    // Custom domain: ask the IC gateway via the `x-ic-canister-id` response header.
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach II at {url} to resolve its canister id: {e}"))?;
-    let id = resp
-        .headers()
-        .get("x-ic-canister-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            format!("II at {url} returned no x-ic-canister-id header; set II_CANISTER_ID")
-        })?;
-    Principal::from_text(id).map_err(|e| format!("invalid x-ic-canister-id from {url}: {e}"))
+/// The II canister the on-demand delegation methods are called on.
+fn ii_canister_id() -> Result<Principal, String> {
+    let raw = std::env::var("II_CANISTER_ID").unwrap_or_else(|_| II_CANISTER_ID_DEFAULT.to_string());
+    Principal::from_text(&raw).map_err(|e| format!("invalid II_CANISTER_ID '{raw}': {e}"))
 }
 
 fn now_ns() -> u64 {
@@ -334,7 +298,7 @@ impl Identities {
             .await
             .ok_or("session vanished")?;
         let origin = target_origin(domain);
-        let canister = ii_canister_id().await?;
+        let canister = ii_canister_id()?;
 
         // Call II AS the standing delegation identity (the anchor's MCP-origin
         // principal) — that's the caller II requires for account derivation.

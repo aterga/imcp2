@@ -126,8 +126,9 @@ enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
 codes live 120s, connects 600s, access tokens 1h.
 
 Set the public base URL (used in the discovery docs and as the MCP origin) with
-`PUBLIC_URL`; point everything at a single Internet Identity instance with
-`II_URL` (defaults to `beta.id.ai`).
+`PUBLIC_URL`. The Internet Identity instance is `II_URL` (browser login, default
+`beta.id.ai`) plus `II_CANISTER_ID` (the canister the account-delegation calls
+target, default `fgte5-ciaaa-aaaad-aaatq-cai`) — both point at the same II.
 
 ## Domain identities (on demand)
 
@@ -159,11 +160,10 @@ mcp_get_account_delegation :
 
 - `target_origin` is `https://<domain>`, with IC gateway domains remapped:
   `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
-- These methods live on the **same II instance** as the connect-time login: the
-  canister id is resolved from `II_URL` — from its host label for a
-  `<canister>.icp0.io` URL, or from the gateway's `x-ic-canister-id` header for a
-  custom domain like `beta.id.ai` (override with `II_CANISTER_ID`). Calls go over
-  `https://icp-api.io`.
+- These methods live on the **same II instance** as the connect-time login:
+  `II_URL` (default `https://beta.id.ai`) is the browser login origin and
+  `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
+  canister) is the canister these calls target, over `https://icp-api.io`.
 - Derived delegations are cached per `(session, domain)` and reused until they
   near expiry, then re-derived.
 
