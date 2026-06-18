@@ -13,20 +13,21 @@ encoding/decoding and signing against the IC via
 |------|------|---------|
 | `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `identity` | Reply as textual Candid, called as `anonymous` or as a domain identity derived on demand |
-| `get_principal` | `identity` | The principal for `anonymous` or a domain (derives the delegation on demand, same as `call_canister`), without making a call |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
+| `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
 
 `discover_canisters` is the entry point when the user names a **website** instead
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
 backend candidates mined from `/env.json` + the JS bundle (pick by label, prefer
 production/`IC_` ids, confirm with `get_candid`).
 
-`call_canister` runs as `identity` — `anonymous` by default, or a domain (e.g.
-`oisy.com`). For a domain, the server mints a **short-lived (≤5 min) account
-delegation for that app on demand** from the connection's standing Internet
-Identity credential (see [Domain identities](#domain-identities-on-demand)) —
-there is no per-app sign-in step. All these tools require a bearer token
-(see Auth).
+`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`)
+to call as your account at that app. For a domain, the server mints a
+**short-lived (≤5 min) account delegation on demand** from the connection's
+standing Internet Identity credential (see
+[Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
+step. `get_principal` returns that account's principal without a call. All these
+tools require a bearer token (see Auth).
 
 ## Connect from an MCP client
 
@@ -140,8 +141,8 @@ There is no per-app browser sign-in. Instead the model is:
   a chain `anchor → backend session key` issued for the MCP origin. The backend
   holds a per-session Ed25519 key that this delegation ends at, so it can sign as
   the anchor's MCP-origin principal. Reconnect when it expires.
-- **App delegations minted on demand.** When `call_canister` is invoked with a
-  domain `identity` (e.g. `oisy.com`), the backend mints a **short-lived
+- **App delegations minted on demand.** When `call_canister` (or `get_principal`)
+  is invoked with a `domain` (e.g. `oisy.com`), the backend mints a **short-lived
   (≤5 min) per-app account delegation on demand**: signing *as the standing
   identity*, it calls Internet Identity's account-derivation methods directly —
   no browser round-trip — with the app's target origin and the backend session
@@ -182,7 +183,7 @@ mcp_get_account_delegation :
       public key out, delegation in); verified II delegation; PKCE; expiring tokens.
 - [x] On-demand **domain identities**: a 60-min standing II delegation per
       connection mints ≤5-min per-app account delegations directly via II canister
-      methods (`call_canister` `identity`); no per-app browser flow.
+      methods (`call_canister`/`get_principal` `domain`); no per-app browser flow.
 - [ ] Deploy the `mcp_*_account_delegation` canister methods (server is built
       against their candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).

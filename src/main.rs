@@ -87,19 +87,14 @@ struct CallCanisterArgs {
     /// If true, perform a read-only `query` call; otherwise an `update` call.
     #[serde(default)]
     is_query: bool,
-    /// Which identity to call as: "anonymous" (default), or a domain whose
-    /// account delegation is derived on demand for this connection, e.g.
-    /// "oisy.com".
-    #[serde(default = "default_identity")]
-    identity: String,
+    /// Application domain to call as, e.g. "oisy.com" — its account delegation is
+    /// derived on demand for this connection. Omit to call anonymously.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 fn default_args() -> String {
     "()".to_string()
-}
-
-fn default_identity() -> String {
-    "anonymous".to_string()
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -110,11 +105,10 @@ struct DiscoverCanistersArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetPrincipalArgs {
-    /// Whose principal to return: "anonymous" (default) or a domain (e.g.
-    /// "oisy.com"), in which case the account delegation for that app is derived
-    /// on demand (same as call_canister) and its principal returned.
-    #[serde(default = "default_identity")]
-    identity: String,
+    /// The application domain to resolve, e.g. "oisy.com". Returns the principal
+    /// you act as at that app — its account delegation is derived on demand (same
+    /// as call_canister) and its principal returned.
+    domain: String,
 }
 
 #[derive(Clone)]
@@ -161,7 +155,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. `identity` selects who you call as: \"anonymous\" (default) or a domain (e.g. \"oisy.com\"), in which case a short-lived account delegation for that app is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls."
     )]
     async fn call_canister(
         &self,
@@ -170,7 +164,7 @@ impl IcTools {
             method,
             args,
             is_query,
-            identity,
+            domain,
         }): Parameters<CallCanisterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -186,26 +180,27 @@ impl IcTools {
             Err(e) => return Ok(err(format!("could not parse args `{args}`: {e}"))),
         };
 
-        // Pick the agent: anonymous uses the shared agent; a domain identity
+        // Pick the agent: no domain uses the shared anonymous agent; a domain
         // derives a short-lived account delegation for that app on demand and
         // builds an agent backed by it (the server signs as the user's account
         // for that app).
-        let reply = if identity == "anonymous" {
-            raw_call(&self.agent, principal, &method, arg_bytes, is_query).await
-        } else {
-            let session_id = match authed_session(&ctx) {
-                Some(s) => s.session_id,
-                None => return Ok(err("a domain identity needs an authenticated session".into())),
-            };
-            let delegated = match self.identities.delegated_identity(&session_id, &identity).await {
-                Ok(d) => d,
-                Err(e) => return Ok(err(e)),
-            };
-            let agent = match Agent::builder().with_url(IC_URL).with_identity(delegated).build() {
-                Ok(a) => a,
-                Err(e) => return Ok(err(format!("could not build agent: {e}"))),
-            };
-            raw_call(&agent, principal, &method, arg_bytes, is_query).await
+        let reply = match domain {
+            None => raw_call(&self.agent, principal, &method, arg_bytes, is_query).await,
+            Some(domain) => {
+                let session_id = match authed_session(&ctx) {
+                    Some(s) => s.session_id,
+                    None => return Ok(err("calling as a domain needs an authenticated session".into())),
+                };
+                let delegated = match self.identities.delegated_identity(&session_id, &domain).await {
+                    Ok(d) => d,
+                    Err(e) => return Ok(err(e)),
+                };
+                let agent = match Agent::builder().with_url(IC_URL).with_identity(delegated).build() {
+                    Ok(a) => a,
+                    Err(e) => return Ok(err(format!("could not build agent: {e}"))),
+                };
+                raw_call(&agent, principal, &method, arg_bytes, is_query).await
+            }
         };
 
         let reply_bytes = match reply {
@@ -217,27 +212,24 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you would call as for a given `identity`, without making a canister call. \"anonymous\" (default) returns the anonymous principal; a domain (e.g. \"oisy.com\") derives that app's account delegation on demand (same as call_canister) from this connection's standing Internet Identity credential and returns its principal. Use this when a flow needs the principal itself (e.g. to look up a balance/account) rather than to invoke a method."
+        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method."
     )]
     async fn get_principal(
         &self,
-        Parameters(GetPrincipalArgs { identity }): Parameters<GetPrincipalArgs>,
+        Parameters(GetPrincipalArgs { domain }): Parameters<GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if identity == "anonymous" {
-            return Ok(ok(Principal::anonymous().to_text()));
-        }
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
-            None => return Ok(err("a domain identity needs an authenticated session".into())),
+            None => return Ok(err("getting a domain principal needs an authenticated session".into())),
         };
-        let delegated = match self.identities.delegated_identity(&session_id, &identity).await {
+        let delegated = match self.identities.delegated_identity(&session_id, &domain).await {
             Ok(d) => d,
             Err(e) => return Ok(err(e)),
         };
         match delegated.sender() {
             Ok(p) => Ok(ok(p.to_text())),
-            Err(e) => Ok(err(format!("could not derive principal for '{identity}': {e}"))),
+            Err(e) => Ok(err(format!("could not derive principal for '{domain}': {e}"))),
         }
     }
 
@@ -357,11 +349,11 @@ impl ServerHandler for IcTools {
              reference. When the user names a website/domain instead of a canister id, use \
              `discover_canisters` to find the canister(s) behind it (frontend via header, \
              backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface. \
-             `call_canister` calls a method with textual Candid in/out, AS an `identity`: \
-             \"anonymous\" by default, or a domain (e.g. identity=\"oisy.com\") — for a domain, a \
-             short-lived (<=5 min) account delegation for that app is minted ON DEMAND from this \
-             connection's standing Internet Identity credential, with no extra sign-in step. \
-             `get_principal` returns the principal for an `identity` (anonymous or a domain) \
+             `call_canister` calls a method with textual Candid in/out: omit `domain` to call \
+             anonymously, or pass an application domain (e.g. domain=\"oisy.com\") to call as your \
+             account at that app — a short-lived (<=5 min) account delegation for it is minted ON \
+             DEMAND from this connection's standing Internet Identity credential, no extra sign-in. \
+             `get_principal` returns the principal you act as at an application `domain` \
              without making a call — use it when a flow just needs the principal (e.g. to look up \
              a balance or account). The standing credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires."
@@ -421,7 +413,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as <code>anonymous</code>, or as a domain identity derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (the principal for an identity, no call). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call). All speak textual Candid.</p>
 </body></html>"#;
 
 #[tokio::main]
