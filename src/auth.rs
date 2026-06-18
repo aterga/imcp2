@@ -21,7 +21,7 @@ use axum::{
     extract::{Query, State},
     http::{Request, StatusCode},
     middleware::Next,
-    response::{Html, IntoResponse, Json, Redirect, Response},
+    response::{Html, IntoResponse, Json, Response},
     Form,
 };
 use base64::Engine;
@@ -197,7 +197,7 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
         st = urlencoding::encode(&connect_state),
         ttl = ttl_minutes,
     );
-    fragment_redirect(&ii_mcp_url)
+    js_redirect(&ii_mcp_url)
 }
 
 // ---- Connect callback: II form-POSTs the delegation chain here ---------
@@ -249,13 +249,21 @@ pub async fn connect_callback(
     if !pending.client_state.is_empty() {
         redirect.push_str(&format!("&state={}", urlencoding::encode(&pending.client_state)));
     }
-    Redirect::to(&redirect).into_response()
+    // JS navigation, not a 30x: II form-POSTed here, and `form-action` is enforced
+    // across redirects, so a `Location` to the client's redirect_uri would be
+    // blocked. See `js_redirect`.
+    js_redirect(&redirect)
 }
 
-/// Top-level redirect to a URL whose **fragment** must survive (II reads its
-/// params from `#…`). A `Location` header drops the fragment in some clients, so
-/// navigate via script instead.
-fn fragment_redirect(url: &str) -> Response {
+/// Top-level redirect via a script-initiated navigation (`location.replace`)
+/// rather than an HTTP `Location` header. Two reasons:
+///   * the II `/mcp` URL carries its params in the fragment (`#…`), which a
+///     `Location` redirect drops in some clients; and
+///   * the post-connect hop back to the OAuth client must NOT be a 30x response
+///     to II's form POST — browsers enforce `form-action` across redirects, so a
+///     `Location` to the client's `redirect_uri` (not in II's `form-action`) is
+///     blocked. A fresh JS navigation isn't a form submission, so it's exempt.
+fn js_redirect(url: &str) -> Response {
     let safe = url
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
