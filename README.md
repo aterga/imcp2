@@ -3,7 +3,7 @@
 Minimal MCP server that bridges an LLM to the Internet Computer.
 
 The LLM only ever speaks **textual Candid**; this server does all the
-encoding/decoding (and, later, signing) against the IC via
+encoding/decoding and signing against the IC via
 [`ic-agent`](https://github.com/dfinity/agent-rs). The MCP layer is the
 [official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`).
 
@@ -15,10 +15,8 @@ encoding/decoding (and, later, signing) against the IC via
 | `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `identity` | Reply as textual Candid, called as `anonymous` or a signed-in domain |
-| `list_identities` | `wait_for?` | `anonymous` + every signed-in domain (principal + validity); waits for a pending sign-in when `wait_for` is set |
-| `sign_in` | `domain` | A short URL the user opens to authorize that domain via Internet Identity |
-| `sign_out` | `domain?` | Forget a domain's delegation (or all) |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
+| `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
 
 `discover_canisters` is the entry point when the user names a **website** instead
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
@@ -35,10 +33,12 @@ identified service. (`discover_canisters` results are annotated with these label
 inline.) There is no public name-search over arbitrary canisters, so `find_canister`
 covers the IC's labelled services, which is where the meaningful ones live.
 
-`call_canister` runs as `identity` — `anonymous` by default, or a domain you've
-signed into. `sign_in(domain)` returns a URL the user opens; after they approve
-in II, that domain becomes available as an `identity`. All these tools require a
-bearer token (see Auth).
+`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
+call as your account at that app. For a domain, the server mints a **short-lived
+(≤5 min) account delegation on demand** from the connection's standing Internet
+Identity credential (see [Domain identities](#domain-identities-on-demand)) —
+there is no per-app sign-in step. `get_principal` returns that account's principal
+without a call. All these tools require a bearer token (see Auth).
 
 ## Connect from an MCP client
 
@@ -48,9 +48,10 @@ Add the server to Claude Code (replace the URL with wherever it's hosted):
 claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 ```
 
-Then run `/mcp` → **ic-poc** → authenticate: a browser opens the authorize page,
-you sign in with **Internet Identity (id.ai)**, and the four tools become
-available. (Any MCP client with remote HTTP + OAuth support works.)
+Then run `/mcp` → **ic-poc** → authenticate: the browser is sent to **Internet
+Identity**'s `/mcp` flow, you sign in once, and the tools become available
+— that single login is the connection's standing credential. (Any MCP client
+with remote HTTP + OAuth support works.)
 
 ## Run
 
@@ -100,72 +101,102 @@ curl -s "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n
 ## Auth (OAuth 2.1, login via Internet Identity)
 
 `/mcp` is gated by a bearer token. The MCP client obtains it with a standard
-OAuth 2.1 authorization-code flow — except the authorize page logs the user in
-with **Internet Identity (id.ai)** via `@dfinity/auth-client` instead of
-username/password, and the issued token is bound to the resulting **principal**.
+OAuth 2.1 authorization-code flow, except logging in runs **Internet Identity's
+`/mcp` delegation flow** instead of username/password, and the issued token is
+bound to the resulting **principal**.
 
 Endpoints:
 
 - `GET /.well-known/oauth-authorization-server` — AS metadata
 - `GET /.well-known/oauth-protected-resource` — points clients at the AS
 - `POST /oauth/register` — dynamic client registration
-- `GET  /oauth/authorize` — serves the id.ai login page
-- `POST /oauth/approve` — called after II login; mints a principal-bound code
+- `GET  /oauth/authorize` — mints the connection's backend key and redirects the
+  browser to II's `/mcp` flow, sending the backend **public** key
+- `POST /oauth/connect/callback` — II form-POSTs the delegation chain here; the
+  server verifies + stores it and redirects back with a principal-bound code
 - `POST /oauth/token` — exchanges the code for an access token
 
 Unauthenticated `/mcp` requests get `401` with a `WWW-Authenticate` header
 pointing at the resource metadata, as the MCP spec expects.
 
-**The principal is verified, not asserted.** After id.ai login the browser signs
-a server-issued nonce (`GET /oauth/nonce`) with its delegation identity and
-sends the delegation chain. The server (`src/delegation.rs`) verifies:
+**No private key is ever transmitted.** The backend generates a per-connection
+Ed25519 key and sends only its **public** key to II. II logs the user in and
+returns a delegation chain `anchor → backend key` (the 60-minute standing
+credential). The chain itself is the proof of identity, so there is no nonce
+round-trip; the server (`src/delegation.rs`) verifies:
 
-1. the chain links the session key to the II root (the II canister signature is
-   checked against the IC mainnet root key via `ic-signature-verification`);
-2. the leaf session key's signature over the nonce (Ed25519 or P-256);
-3. the principal is `self_authenticating(root_pubkey)`;
-4. no delegation has expired.
+1. the chain links to the II root (the II canister signature is checked against
+   the IC mainnet root key via `ic-signature-verification`);
+2. no delegation has expired;
+3. the chain ends at this connection's backend key (so the backend, holding the
+   private half, can sign with it);
+4. the principal is `self_authenticating(user_key)`.
 
 Only then is a principal-bound code minted. This matters because the server
 keys per-principal session data off that identity — a spoofable principal would
 let one user read another's session. (Fund safety is independent: that's
 enforced by the IC at signing time, not here.) **PKCE (S256) is enforced**;
-codes live 120s, nonces 300s, access tokens 1h.
+codes live 120s, connects 600s, access tokens 1h.
 
-Set the public base URL (used in discovery docs + the sign-in redirect) with
-`PUBLIC_URL`; point the II `/mcp` flow at a deployment with `II_MCP_URL`
-(defaults to the staging II canister).
+Set the public base URL (used in the discovery docs and as the MCP origin) with
+`PUBLIC_URL`. The Internet Identity instance is `II_URL` (browser login, default
+`beta.id.ai`) plus `II_CANISTER_ID` (the canister the account-delegation calls
+target, default `fgte5-ciaaa-aaaad-aaatq-cai`) — both point at the same II.
 
-## Domain identities (II `/mcp` delegation)
+## Domain identities (on demand)
 
-Instead of signing each call in the browser, the MCP server holds a **per-session
-Ed25519 key** and obtains a **delegation** from Internet Identity that acts as
-the user's *default account for an app* (II PR
-[dfinity/internet-identity#4026](https://github.com/dfinity/internet-identity/pull/4026)).
-The server then signs calls as that identity with `ic-agent`'s `DelegatedIdentity`.
+There is no per-app browser sign-in. Instead the model is:
 
-Flow:
-1. `sign_in("oisy.com")` → a short `…/signin/<link>` URL the user opens.
-2. `GET /signin/<link>` checks the browser's `mcp_session` cookie matches the
-   link's session, sets a `SameSite=None` flow cookie, and redirects to II's
-   `/mcp` (`#public_key&callback&state&app&ttl`).
-3. II consent → top-level form-POST of the delegation chain to
-   `/signin/callback`, which verifies the flow cookie + single-use `state` and
-   stores the delegation under that session + domain.
-4. `call_canister(identity="oisy.com", …)` now signs as the user's oisy account.
+- **One standing credential per connection.** When you connect (authenticate via
+  Internet Identity), the backend obtains a **60-minute standing delegation** —
+  a chain `anchor → backend session key` issued for the MCP origin. The backend
+  holds a per-session Ed25519 key that this delegation ends at, so it can sign as
+  the anchor's MCP-origin principal. Reconnect when it expires.
+- **App delegations minted on demand.** When `call_canister` (or `get_principal`)
+  is invoked with a `domain` (e.g. `oisy.com`), the backend mints a **short-lived
+  (≤5 min) per-app account delegation on demand**: signing *as the standing
+  identity*, it calls Internet Identity's account-derivation methods directly —
+  no browser round-trip — with the app's target origin and the backend session
+  key as `session_key`. The returned chain ends at the backend session key, so
+  the backend signs the canister call with `ic-agent`'s `DelegatedIdentity`.
 
-**Binding:** the delegation can only land in the session that requested it
-(`state`), and only via the same browser that authenticated that session
-(`mcp_session` cookie at `GET /signin`, `SameSite=None` flow cookie on the
-callback) — so a shared sign-in link can't be completed for someone else.
+The on-demand derivation calls two **new II canister methods**:
+
+```candid
+mcp_prepare_account_delegation :
+  (target_origin: text, session_key: blob, max_ttl_ns: opt nat64)
+    -> (record { user_key: blob; expiration: nat64 });
+mcp_get_account_delegation :
+  (target_origin: text, session_key: blob, expiration: nat64)
+    -> (variant { Ok: SignedDelegation; Err: text });
+```
+
+- `target_origin` is `https://<domain>`, with IC gateway domains remapped:
+  `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
+- These methods live on the **same II instance** as the connect-time login:
+  `II_URL` (default `https://beta.id.ai`) is the browser login origin and
+  `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
+  canister) is the canister these calls target, over `https://icp-api.io`.
+- Derived delegations are cached per `(session, domain)` and reused until they
+  near expiry, then re-derived.
+
+> **Status:** the standing-credential connect flow runs against II's existing
+> `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
+> for on-demand app delegations land in
+> [dfinity/internet-identity#4034](https://github.com/dfinity/internet-identity/pull/4034);
+> the on-demand path works once that II build is deployed to the configured
+> `II_URL` (the server is built against the same candid contract).
 
 ## Roadmap
 
 - [x] Candid tools over MCP streamable-HTTP; `discover_canisters`; Candid
       reference resources.
-- [x] OpenID/OAuth auth (authorize page logs in via `@dfinity/auth-client`
-      against **id.ai**); verified II delegation; PKCE; expiring tokens.
-- [x] Per-session **domain identities** via II's `/mcp` delegation flow
-      (`sign_in` / `sign_out` / `list_identities`; `call_canister` `identity`).
+- [x] OpenID/OAuth auth: connecting runs II's `/mcp` delegation flow (backend
+      public key out, delegation in); verified II delegation; PKCE; expiring tokens.
+- [x] On-demand **domain identities**: a 60-min standing II delegation per
+      connection mints ≤5-min per-app account delegations directly via II canister
+      methods (`call_canister`/`get_principal` `domain`); no per-app browser flow.
+- [ ] Deploy the `mcp_*_account_delegation` canister methods (server is built
+      against their candid contract; the live round-trip lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.
