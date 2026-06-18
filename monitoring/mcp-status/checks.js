@@ -40,6 +40,8 @@ import {
  * @property {string | undefined} version  The running build's package version.
  * @property {string | undefined} commit   The running build's git commit (or "unknown").
  * @property {string | undefined} commitUrl GitHub URL for the commit, when it is a real SHA.
+ * @property {number | undefined} builtAt   Build time (Unix epoch seconds), when known.
+ * @property {number | undefined} startedAt When the running process started (Unix epoch seconds) — the last redeployment.
  *
  * @typedef {Object} DashboardReport
  * @property {string} generatedAt
@@ -215,7 +217,17 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
       json && typeof json.commit === "string" ? json.commit : undefined;
     const version =
       json && typeof json.version === "string" ? json.version : undefined;
-    facts.deployment = { version, commit, commitUrl: commitUrl(commit) };
+    const builtAt =
+      json && Number.isFinite(json.built_at) ? json.built_at : undefined;
+    const startedAt =
+      json && Number.isFinite(json.started_at) ? json.started_at : undefined;
+    facts.deployment = {
+      version,
+      commit,
+      commitUrl: commitUrl(commit),
+      builtAt,
+      startedAt,
+    };
     const exposed = r.ok && r.status === 200 && !!commit;
     const known = exposed && commit !== "unknown";
     checks.push({
@@ -767,13 +779,14 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
   {
     const url = `${iiOrigin}/.config.did.bin`;
     const cr = await probe(url, { timeoutMs });
+    // Use the server-reported byte count; `bodyText.length` counts UTF-16 code
+    // units (probe() decodes the body as text), which misreports a binary blob.
     const lenHeader = Number(cr.headers.get("content-length"));
     const bytes =
-      Number.isFinite(lenHeader) && lenHeader > 0
-        ? lenHeader
-        : cr.bodyText.length;
+      Number.isFinite(lenHeader) && lenHeader >= 0 ? lenHeader : undefined;
+    const nonEmpty = bytes !== undefined ? bytes > 0 : cr.bodyText.length > 0;
     const contentType = cr.headers.get("content-type") ?? "";
-    const present = cr.ok && cr.status === 200 && bytes > 0;
+    const present = cr.ok && cr.status === 200 && nonEmpty;
     facts.configDid = {
       status: cr.status,
       bytes,
@@ -791,7 +804,9 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       latencyMs: cr.latencyMs,
       detail: cr.error
         ? `request failed: ${cr.error.message}`
-        : `${cr.status}, ${bytes} bytes${contentType ? `, ${contentType}` : ""}`,
+        : bytes !== undefined
+          ? `${cr.status}, ${bytes} bytes${contentType ? `, ${contentType}` : ""}`
+          : `${cr.status}${contentType ? `, ${contentType}` : ""}`,
     });
   }
 
@@ -978,6 +993,8 @@ export const runDashboard = async (overrides = {}) => {
         version: undefined,
         commit: undefined,
         commitUrl: undefined,
+        builtAt: undefined,
+        startedAt: undefined,
       }
     ),
     overall: worstStatus(sections.map((s) => s.status)),

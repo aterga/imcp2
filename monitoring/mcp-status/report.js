@@ -13,6 +13,32 @@ const ANSI = {
 const ICON = { pass: "✔", warn: "▲", fail: "✘" };
 
 /**
+ * Format a Unix-epoch-seconds timestamp as ISO + a coarse relative age.
+ * @param {number | undefined} epochSec
+ * @returns {string | undefined}
+ */
+const fmtTime = (epochSec) => {
+  if (!Number.isFinite(epochSec)) return undefined;
+  const d = new Date(epochSec * 1000);
+  const diff = Date.now() - d.getTime();
+  const abs = Math.abs(diff);
+  const units = /** @type {[string, number][]} */ ([
+    ["d", 86_400_000],
+    ["h", 3_600_000],
+    ["m", 60_000],
+    ["s", 1000],
+  ]);
+  let rel = "just now";
+  for (const [u, ms] of units) {
+    if (abs >= ms) {
+      rel = `${Math.floor(abs / ms)}${u} ${diff >= 0 ? "ago" : "from now"}`;
+      break;
+    }
+  }
+  return `${d.toISOString()} (${rel})`;
+};
+
+/**
  * @param {import("./checks.js").DashboardReport} report
  * @param {{ color?: boolean }} [opts]
  * @returns {string}
@@ -47,6 +73,14 @@ export const renderText = (report, opts = {}) => {
       `Deployment: ${c(ANSI.cyan, label || "unknown")}` +
         (dep.commitUrl ? `  ${c(ANSI.dim, dep.commitUrl)}` : ""),
     );
+    const started = fmtTime(dep.startedAt);
+    if (started) {
+      lines.push(`Last redeployed: ${c(ANSI.cyan, started)}`);
+    }
+    const built = fmtTime(dep.builtAt);
+    if (built) {
+      lines.push(c(ANSI.dim, `Built: ${built}`));
+    }
   }
   lines.push(`Overall: ${tag(report.overall)}`);
 

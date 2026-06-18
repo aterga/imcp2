@@ -704,17 +704,28 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(store.clone());
 
+    // When this process started — i.e. when the deployment last (re)started.
+    // Every deploy restarts the service, so this is the "last redeployment" time.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
-        // Unauthenticated build/version probe: reports the running commit (baked
-        // in at build time via the GIT_SHA env var) so operators and the status
-        // dashboard can confirm exactly which deployment is live.
+        // Unauthenticated build/version probe so operators and the status
+        // dashboard can confirm exactly which deployment is live: the running
+        // commit (baked in at build time via GIT_SHA), the build time
+        // (BUILD_TIME), and when this process started (= last redeployment).
+        // Timestamps are Unix epoch seconds (or null when unknown).
         .route(
             "/version",
-            axum::routing::get(|| async {
+            axum::routing::get(move || async move {
                 axum::Json(serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
+                    "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
+                    "started_at": started_at,
                 }))
             }),
         )

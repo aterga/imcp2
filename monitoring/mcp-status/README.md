@@ -26,8 +26,9 @@ It answers three questions and adds a few suggestions:
 
 Every check carries a plain-language description, and the report shows which
 **deployment is running** — the MCP server's version and git commit (read from
-`GET /version`), linked to the commit on GitHub. The web dashboard groups the
-sections into **tabs** for easier navigation.
+`GET /version`, linked to the commit on GitHub), **when it was last redeployed**
+(the server process's start time), and its build time. The web dashboard groups
+the sections into **tabs** for easier navigation.
 
 ## Usage
 

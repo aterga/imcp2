@@ -125,7 +125,12 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
     [`GET ${origin}/`]: resp(200, { headers: { "content-type": "text/html" } }),
     [`GET ${origin}/version`]: resp(200, {
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ version: "0.1.0", commit: "abc123def4567890" }),
+      body: JSON.stringify({
+        version: "0.1.0",
+        commit: "abc123def4567890",
+        built_at: 1_700_000_000,
+        started_at: 1_700_000_500,
+      }),
     }),
     [`GET ${origin}/.well-known/oauth-protected-resource`]: resp(200, {
       headers: { "content-type": "application/json" },
@@ -175,6 +180,8 @@ test("checkMcpEndpoints passes for a well-behaved server", async () => {
       facts.deployment.commitUrl,
       "https://github.com/aterga/imcp2/commit/abc123def4567890",
     );
+    assert.equal(facts.deployment.builtAt, 1_700_000_000);
+    assert.equal(facts.deployment.startedAt, 1_700_000_500);
     // Every check carries a human-readable description.
     for (const c of section.checks) {
       assert.ok(
@@ -233,7 +240,10 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
       },
     }),
     [`GET ${ii}/.config.did.bin`]: resp(200, {
-      headers: { "content-type": "application/octet-stream" },
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-length": "20",
+      },
       body: "DIDLbinaryconfigblob",
     }),
   });
@@ -246,7 +256,7 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
     assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
     assert.equal(facts.configDid.status, 200);
-    assert.ok(facts.configDid.bytes > 0);
+    assert.equal(facts.configDid.bytes, 20);
   } finally {
     restore();
   }
