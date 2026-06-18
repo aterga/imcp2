@@ -1,11 +1,14 @@
-//! Minimal MCP PoC: an MCP server exposing two tools over streamable HTTP that
-//! talk to the Internet Computer via ic-agent.
+//! Minimal MCP PoC: an MCP server exposing tools over streamable HTTP that talk
+//! to the Internet Computer via ic-agent.
 //!
 //!   1. `get_candid`   — fetch a canister's Candid interface (`candid:service` metadata).
-//!   2. `call_canister` — call any method with textual Candid in, textual Candid out.
+//!   2. `discover_canisters` — find the canisters behind a web domain.
+//!   3. `call_canister` — call any method with textual Candid in, textual Candid out,
+//!      as `anonymous` or as a domain identity derived ON DEMAND.
 //!
 //! The LLM only ever deals with textual Candid; encoding/decoding happens here.
-//! Calls are anonymous for now (query methods + read-only). Signing comes later.
+//! Anonymous calls use the shared anonymous agent. A domain identity is minted
+//! on demand from the connection's standing II delegation (see `identities`).
 
 mod auth;
 mod delegation;
@@ -14,7 +17,6 @@ mod identities;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::Agent;
-use axum::response::IntoResponse;
 use identities::Identities;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -85,8 +87,9 @@ struct CallCanisterArgs {
     /// If true, perform a read-only `query` call; otherwise an `update` call.
     #[serde(default)]
     is_query: bool,
-    /// Which identity to call as: "anonymous" (default), or a domain you've
-    /// signed into (see list_identities / sign_in), e.g. "oisy.com".
+    /// Which identity to call as: "anonymous" (default), or a domain whose
+    /// account delegation is derived on demand for this connection, e.g.
+    /// "oisy.com".
     #[serde(default = "default_identity")]
     identity: String,
 }
@@ -103,27 +106,6 @@ fn default_identity() -> String {
 struct DiscoverCanistersArgs {
     /// A web domain or URL served from the IC, e.g. "oisy.com".
     domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct SignInArgs {
-    /// The app domain to sign into, e.g. "oisy.com".
-    domain: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema, Default)]
-struct ListIdentitiesArgs {
-    /// Optional: after starting a sign_in, pass that domain here to WAIT (up to
-    /// ~55s) for the user to finish, instead of returning immediately.
-    #[serde(default)]
-    wait_for: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema, Default)]
-struct SignOutArgs {
-    /// Domain identity to forget, e.g. "oisy.com". Omit to sign out of all.
-    #[serde(default)]
-    domain: Option<String>,
 }
 
 #[derive(Clone)]
@@ -170,7 +152,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. `identity` selects who you call as: \"anonymous\" (default) or a domain you've signed into via sign_in (e.g. \"oisy.com\") — see list_identities. Set is_query=true for read-only query calls."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. `identity` selects who you call as: \"anonymous\" (default) or a domain (e.g. \"oisy.com\"), in which case a short-lived account delegation for that app is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls."
     )]
     async fn call_canister(
         &self,
@@ -196,8 +178,9 @@ impl IcTools {
         };
 
         // Pick the agent: anonymous uses the shared agent; a domain identity
-        // builds an agent backed by that domain's delegation (the server signs
-        // as the user's account for that app).
+        // derives a short-lived account delegation for that app on demand and
+        // builds an agent backed by it (the server signs as the user's account
+        // for that app).
         let reply = if identity == "anonymous" {
             raw_call(&self.agent, principal, &method, arg_bytes, is_query).await
         } else {
@@ -222,80 +205,6 @@ impl IcTools {
         };
         // Decode against the canister's Candid interface so field names are recovered.
         Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
-    }
-
-    #[tool(description = "List the identities you can call as: \"anonymous\" plus every domain you've signed into (principal + remaining validity). After a sign_in, call this with wait_for=<domain> — it waits (~55s) for the user to finish so you can confirm yourself instead of asking them; if it returns still-pending, call again.")]
-    async fn list_identities(
-        &self,
-        Parameters(ListIdentitiesArgs { wait_for }): Parameters<ListIdentitiesArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let session_id = authed_session(&ctx).map(|s| s.session_id).unwrap_or_default();
-        let mut pending_note = None;
-        if let Some(domain) = wait_for.as_deref() {
-            let landed = self
-                .identities
-                .wait_for_delegation(&session_id, domain, std::time::Duration::from_secs(55))
-                .await;
-            if !landed {
-                pending_note = Some(format!(
-                    "\nStill waiting for the user to finish signing in to {domain}. \
-                     If they have, call list_identities again with wait_for=\"{domain}\"."
-                ));
-            }
-        }
-        let mut out = String::from("Identities (use as `identity` in call_canister):\n");
-        for i in self.identities.list(&session_id).await {
-            out.push_str(&format!("- {} — {} ({})\n", i.name, i.principal, i.note));
-        }
-        if let Some(n) = pending_note {
-            out.push_str(&n);
-        }
-        Ok(ok(out))
-    }
-
-    #[tool(description = "Sign in to a domain with Internet Identity so you can call canisters as the user's account for that app. Returns a short URL the USER must open in the same browser they signed into this MCP with. After they approve, that domain becomes available as an `identity` in call_canister. Use the same tool to re-sign-in when a delegation expires.")]
-    async fn sign_in(
-        &self,
-        Parameters(SignInArgs { domain }): Parameters<SignInArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        // Accept a bare host or a URL; normalise to the hostname.
-        let domain = domain.trim().trim_start_matches("https://").trim_start_matches("http://");
-        let domain = domain.split('/').next().unwrap_or(domain).to_string();
-        if domain.is_empty() {
-            return Ok(err("provide a domain, e.g. oisy.com".into()));
-        }
-        let session_id = match authed_session(&ctx) {
-            Some(s) => s.session_id,
-            None => return Ok(err("sign_in needs an authenticated session".into())),
-        };
-        let url = self.identities.start_sign_in(&session_id, &domain).await;
-        Ok(ok(format!(
-            "Ask the user to open this URL in the same browser they used to connect this MCP \
-             (it's bound to their session):\n{url}\n\
-             Then immediately call list_identities with wait_for=\"{domain}\" — it blocks until \
-             they finish, so you confirm it yourself. Do NOT ask the user to tell you when \
-             they're done. Once {domain} appears, call_canister with identity=\"{domain}\"."
-        )))
-    }
-
-    #[tool(description = "Sign out of a domain identity (forget its delegation). Pass a domain to forget that one, or omit to sign out of all. Anonymous always remains.")]
-    async fn sign_out(
-        &self,
-        Parameters(SignOutArgs { domain }): Parameters<SignOutArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let session_id = match authed_session(&ctx) {
-            Some(s) => s.session_id,
-            None => return Ok(err("sign_out needs an authenticated session".into())),
-        };
-        let removed = self.identities.sign_out(&session_id, domain.as_deref()).await;
-        Ok(ok(match domain {
-            Some(d) if removed > 0 => format!("Signed out of {d}."),
-            Some(d) => format!("Was not signed in to {d}."),
-            None => format!("Signed out of all {removed} domain identities."),
-        }))
     }
 
     #[tool(
@@ -384,156 +293,6 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
         .cloned()
 }
 
-fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    raw.split(';')
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_string())
-}
-
-/// GET /signin/{link} — consume the single-use link, set a flow cookie, and
-/// redirect to II's /mcp delegation flow. The link opens in any browser; the
-/// user confirms the verified identity afterward (see `signin_confirm_*`).
-async fn signin_redirect(
-    axum::extract::State(identities): axum::extract::State<Identities>,
-    axum::extract::Path(link): axum::extract::Path<String>,
-) -> axum::response::Response {
-    match identities.begin_redirect(&link).await {
-        Ok((url, flow)) => {
-            let cookie = format!(
-                "mcp_flow={flow}; Path=/signin; HttpOnly; Secure; SameSite=None; Max-Age=600"
-            );
-            (
-                axum::http::StatusCode::SEE_OTHER,
-                [
-                    (axum::http::header::LOCATION, url),
-                    (axum::http::header::SET_COOKIE, cookie),
-                ],
-            )
-                .into_response()
-        }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct CallbackForm {
-    delegation: String,
-    state: String,
-}
-
-/// POST /signin/callback — II form-POSTs the delegation here; verify flow cookie
-/// + state, stage the verified delegation, then send the browser to the
-/// confirmation page (which shows the principal + domain before it lands).
-async fn signin_callback(
-    axum::extract::State(identities): axum::extract::State<Identities>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Form(form): axum::extract::Form<CallbackForm>,
-) -> axum::response::Response {
-    let flow = cookie_value(&headers, "mcp_flow");
-    let location = match identities
-        .complete_callback(&form.state, flow.as_deref(), &form.delegation)
-        .await
-    {
-        Ok(confirm) => format!(
-            "{}/signin/confirm?c={}",
-            auth::base_url(),
-            urlencoding::encode(&confirm)
-        ),
-        Err(e) => {
-            tracing::warn!("sign-in callback rejected: {e}");
-            identities::ii_status_url(false)
-        }
-    };
-    (
-        axum::http::StatusCode::SEE_OTHER,
-        [(axum::http::header::LOCATION, location)],
-    )
-        .into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct ConfirmQuery {
-    c: String,
-}
-
-/// GET /signin/confirm — show the verified principal + domain and ask the user
-/// to explicitly approve connecting it to the requesting assistant session.
-async fn signin_confirm_page(
-    axum::extract::State(identities): axum::extract::State<Identities>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<ConfirmQuery>,
-) -> axum::response::Response {
-    let flow = cookie_value(&headers, "mcp_flow");
-    match identities.confirm_info(&q.c, flow.as_deref()).await {
-        Some((principal, domain)) => {
-            axum::response::Html(render_confirm_page(&q.c, &principal, &domain)).into_response()
-        }
-        None => (
-            axum::http::StatusCode::BAD_REQUEST,
-            "unknown or used confirmation",
-        )
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct ConfirmForm {
-    confirm: String,
-}
-
-/// POST /signin/confirm — the user approved; verify the flow cookie, store the
-/// delegation under the requesting session, then return to II's status page.
-async fn signin_confirm_submit(
-    axum::extract::State(identities): axum::extract::State<Identities>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Form(form): axum::extract::Form<ConfirmForm>,
-) -> axum::response::Response {
-    let flow = cookie_value(&headers, "mcp_flow");
-    let ok = identities.finalize(&form.confirm, flow.as_deref()).await;
-    if let Err(e) = &ok {
-        tracing::warn!("sign-in confirm rejected: {e}");
-    }
-    (
-        axum::http::StatusCode::SEE_OTHER,
-        [(axum::http::header::LOCATION, identities::ii_status_url(ok.is_ok()))],
-    )
-        .into_response()
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn render_confirm_page(confirm: &str, principal: &str, domain: &str) -> String {
-    let domain = html_escape(domain);
-    let principal = html_escape(principal);
-    let confirm = html_escape(confirm);
-    format!(
-        r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<title>Confirm sign-in</title></head>
-<body style="font-family:system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5">
-<h2>Confirm sign-in to {domain}</h2>
-<p>You signed in as:</p>
-<p style="font-family:ui-monospace,monospace;word-break:break-all;background:#f4f4f5;padding:.5rem .75rem;border-radius:.5rem">{principal}</p>
-<p>Confirming lets the AI assistant session that requested this sign-in act as this
-identity on <b>{domain}</b>. Only continue if <b>you</b> started this from your assistant.</p>
-<form method="post" action="/signin/confirm">
-<input type="hidden" name="confirm" value="{confirm}">
-<button type="submit" style="padding:.6rem 1.2rem;font-size:1rem;border:0;border-radius:.5rem;background:#111;color:#fff;cursor:pointer">Confirm and connect</button>
-</form>
-<p style="color:#71717a;font-size:.85rem;margin-top:1rem">If you didn't start this, just close this page — nothing will be connected.</p>
-</body></html>"#
-    )
-}
-
 /// Perform a query or update call and return the raw Candid reply bytes.
 async fn raw_call(
     agent: &Agent,
@@ -565,10 +324,11 @@ impl ServerHandler for IcTools {
              `discover_canisters` to find the canister(s) behind it (frontend via header, \
              backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface. \
              `call_canister` calls a method with textual Candid in/out, AS an `identity`: \
-             \"anonymous\" by default, or a domain the user has signed into. Use \
-             `list_identities` to see available identities, and `sign_in(domain)` to add one — \
-             it returns a short URL the user opens to authorize via Internet Identity, after \
-             which you can call as that domain (e.g. identity=\"oisy.com\")."
+             \"anonymous\" by default, or a domain (e.g. identity=\"oisy.com\") — for a domain, a \
+             short-lived (<=5 min) account delegation for that app is minted ON DEMAND from this \
+             connection's standing Internet Identity credential, with no extra sign-in step. The \
+             standing credential is obtained when you connect (authenticate via Internet \
+             Identity) and lasts ~60 minutes; reconnect when it expires."
                 .to_string(),
         )
     }
@@ -625,7 +385,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as anonymous or a signed-in domain), <code>list_identities</code>, <code>sign_in</code> / <code>sign_out</code> (Internet Identity per domain). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as <code>anonymous</code>, or as a domain identity derived on demand from the connection's standing Internet Identity delegation). All speak textual Candid.</p>
 </body></html>"#;
 
 #[tokio::main]
@@ -664,16 +424,6 @@ async fn main() -> anyhow::Result<()> {
 
     let store = auth::AuthStore::new();
 
-    // Browser-facing domain sign-in endpoints (II /mcp delegation round-trip).
-    let signin = axum::Router::new()
-        .route("/signin/{link}", axum::routing::get(signin_redirect))
-        .route("/signin/callback", axum::routing::post(signin_callback))
-        .route(
-            "/signin/confirm",
-            axum::routing::get(signin_confirm_page).post(signin_confirm_submit),
-        )
-        .with_state(identities.clone());
-
     // /mcp is gated by a bearer token issued after Internet Identity login.
     let protected_mcp = axum::Router::new()
         .nest_service("/mcp", mcp)
@@ -706,7 +456,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
-        .merge(signin)
         .merge(oauth)
         .merge(protected_mcp);
 

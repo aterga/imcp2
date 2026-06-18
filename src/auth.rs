@@ -56,9 +56,9 @@ struct CodeGrant {
     scope: Option<String>,
     /// Verified Internet Identity principal.
     principal: String,
-    /// Browser/session id minted at approve, set as the `mcp_session` cookie and
-    /// carried to the issued token, so the same browser can later be required to
-    /// own a domain sign-in.
+    /// Session id minted at approve and carried to the issued token. It keys
+    /// the connection's per-session backend key, standing II credential, and
+    /// on-demand per-app account delegations (see `crate::identities`).
     session_id: String,
     code_challenge: Option<String>,
     created: Instant,
@@ -220,17 +220,7 @@ pub async fn approve(State(store): State<AuthStore>, Json(body): Json<ApproveBod
     if !body.state.is_empty() {
         redirect.push_str(&format!("&state={}", body.state));
     }
-    // Bind this browser to the session (set during the same-origin approve fetch)
-    // so it can later be required to own a domain sign-in. Lax: sent on the
-    // first-party top-level GET /signin navigation.
-    let cookie = format!(
-        "mcp_session={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400"
-    );
-    (
-        [(axum::http::header::SET_COOKIE, cookie)],
-        Json(json!({ "redirect": redirect })),
-    )
-        .into_response()
+    Json(json!({ "redirect": redirect })).into_response()
 }
 
 fn verify_login_proof(body: &ApproveBody) -> Result<candid::Principal, String> {
