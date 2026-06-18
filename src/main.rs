@@ -106,6 +106,19 @@ struct DiscoverCanistersArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FindCanisterArgs {
+    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
+    /// "OpenChat".
+    query: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct LookupCanisterArgs {
+    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
+    canister_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SignInArgs {
     /// The app domain to sign into, e.g. "oisy.com".
     domain: String,
@@ -309,24 +322,84 @@ impl IcTools {
             Ok(found) if !found.is_empty() => {
                 let mut out = format!("Canisters discovered for {domain}:\n");
                 for f in &found {
+                    // Dashboard identity (name/type), filled in during discovery.
+                    let identity = match (&f.name, &f.kind) {
+                        (Some(n), Some(k)) => format!("  «{n}» ({k})"),
+                        (Some(n), None) => format!("  «{n}»"),
+                        _ => String::new(),
+                    };
                     out.push_str(&format!(
-                        "- {}{} [{}]\n",
+                        "- {}{}{} [{}]\n",
                         f.canister_id,
                         f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
+                        identity,
                         f.sources.join(", "),
                     ));
                 }
                 out.push_str(
                     "\nThe `header` (x-ic-canister-id) entry is the frontend/asset canister and is \
                      authoritative. Others come from env.json or the JS bundle and may include \
-                     multiple environments (prefer the production/IC ids). No authoritative \
-                     reverse lookup exists — confirm an interface with get_candid before calling.",
+                     multiple environments (prefer the production/IC ids). A «name» (type) is the \
+                     IC dashboard's label for that id. No authoritative reverse lookup exists — \
+                     confirm an interface with get_candid before calling.",
                 );
                 Ok(ok(out))
             }
             Ok(_) => Ok(ok(format!(
                 "No IC canisters found for {domain} — is it served from the Internet Computer?"
             ))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
+        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)"
+    )]
+    async fn find_canister(
+        &self,
+        Parameters(FindCanisterArgs { query }): Parameters<FindCanisterArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match discover::search_by_name(&query).await {
+            Ok(matches) if !matches.is_empty() => {
+                let mut out = format!("Canisters matching \"{query}\":\n");
+                for m in &matches {
+                    out.push_str(&format!(
+                        "- {} — {} [{}]{}\n",
+                        m.canister_id,
+                        m.name,
+                        m.kind,
+                        m.note.as_deref().map(|n| format!("  — {n}")).unwrap_or_default(),
+                    ));
+                }
+                out.push_str(
+                    "\nConfirm an interface with get_candid, then call methods with call_canister. \
+                     For an SNS match the id is the project root — lookup_canister it to learn more.",
+                );
+                Ok(ok(out))
+            }
+            Ok(_) => Ok(ok(format!(
+                "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
+                 ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
+                 labelled service. If you have a website, try discover_canisters; if you already \
+                 have a canister id, try lookup_canister or get_candid."
+            ))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
+        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters."
+    )]
+    async fn lookup_canister(
+        &self,
+        Parameters(LookupCanisterArgs { canister_id }): Parameters<LookupCanisterArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = match discover::http_client() {
+            Ok(c) => c,
+            Err(e) => return Ok(err(e)),
+        };
+        match discover::lookup_canister(&client, &canister_id).await {
+            Ok(info) => Ok(ok(format_canister_info(&info))),
             Err(e) => Ok(err(e)),
         }
     }
@@ -563,7 +636,11 @@ impl ServerHandler for IcTools {
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
              `discover_canisters` to find the canister(s) behind it (frontend via header, \
-             backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface. \
+             backend via env.json/JS bundle). When they name a TOKEN, PROJECT or SERVICE (e.g. \
+             \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
+             registries and get its canister id. `lookup_canister(id)` tells you what a bare \
+             canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
+             canister's Candid interface. \
              `call_canister` calls a method with textual Candid in/out, AS an `identity`: \
              \"anonymous\" by default, or a domain the user has signed into. Use \
              `list_identities` to see available identities, and `sign_in(domain)` to add one — \
@@ -612,6 +689,35 @@ impl ServerHandler for IcTools {
     }
 }
 
+/// Render an IC dashboard canister identity as readable text for lookup_canister.
+fn format_canister_info(info: &discover::CanisterInfo) -> String {
+    let mut s = format!("Canister {}\n", info.canister_id);
+    s.push_str(&format!(
+        "- name: {}\n",
+        info.name.as_deref().unwrap_or("(unlabelled — not a known/named canister)")
+    ));
+    if let Some(t) = &info.canister_type {
+        s.push_str(&format!("- type: {t}\n"));
+    }
+    if let Some(sub) = &info.subnet_id {
+        s.push_str(&format!("- subnet: {sub}\n"));
+    }
+    if !info.controllers.is_empty() {
+        s.push_str(&format!("- controllers: {}\n", info.controllers.join(", ")));
+    }
+    if let Some(lang) = &info.language {
+        s.push_str(&format!("- language: {lang}\n"));
+    }
+    if let Some(mh) = &info.module_hash {
+        s.push_str(&format!("- module hash: {mh}\n"));
+    }
+    if let Some(p) = info.latest_upgrade_proposal {
+        s.push_str(&format!("- latest upgrade: NNS proposal {p}\n"));
+    }
+    s.push_str("\nFetch its interface with get_candid, then call methods with call_canister.");
+    s
+}
+
 fn ok(text: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
@@ -625,7 +731,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (as anonymous or a signed-in domain), <code>list_identities</code>, <code>sign_in</code> / <code>sign_out</code> (Internet Identity per domain). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (as anonymous or a signed-in domain), <code>list_identities</code>, <code>sign_in</code> / <code>sign_out</code> (Internet Identity per domain). All speak textual Candid.</p>
 </body></html>"#;
 
 #[tokio::main]
