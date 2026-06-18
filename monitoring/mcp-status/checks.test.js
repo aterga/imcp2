@@ -1,5 +1,6 @@
 // Unit tests for the IMCP status dashboard probing logic.
-// Run with:  node --test monitoring/mcp-status/
+// Run with:  node --test monitoring/mcp-status/checks.test.js
+//        or: cd monitoring/mcp-status && npm test
 //
 // These tests stub the global `fetch` so they make no real network calls.
 // (TLS certificate inspection targets unresolvable test hostnames and so

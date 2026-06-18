@@ -25,12 +25,14 @@ It answers three questions and adds a few suggestions:
 
 ## Usage
 
-No install step and no dependencies — just Node ≥ 20 (uses the global `fetch`).
+No build step and no dependencies — just Node ≥ 20 (uses the global `fetch`).
+The commands below are shown from the repository root; equivalent `npm` scripts
+live in `monitoring/mcp-status/package.json` — run them from that directory
+(e.g. `cd monitoring/mcp-status && npm start`).
 
 ```bash
 # Text report for the default beta deployment (exit code 0 = healthy)
-npm run mcp-status
-node monitoring/mcp-status/cli.js
+node monitoring/mcp-status/cli.js                                  # or: npm start
 
 # Point it at another deployment (e.g. production)
 node monitoring/mcp-status/cli.js --mcp https://mcp.id.ai
@@ -40,11 +42,10 @@ node monitoring/mcp-status/cli.js --json
 
 # Live web dashboard at http://localhost:8080 (auto-refreshing)
 # (target is fixed at startup; pass --mcp/--ii to monitor another deployment)
-npm run mcp-status:serve
-node monitoring/mcp-status/server.js --port 8080 --mcp https://mcp.id.ai
+node monitoring/mcp-status/server.js --port 8080 --mcp https://mcp.id.ai   # or: npm run serve
 
 # Unit tests
-npm run mcp-status:test
+node --test monitoring/mcp-status/checks.test.js                  # or: npm test
 ```
 
 CLI options: `--mcp <origin>`, `--ii <origin>`, `--timeout <ms>`, `--json`,
@@ -84,6 +85,7 @@ actually matters.
 | `server.js`        | HTTP server: serves the dashboard and runs probes server-side. |
 | `public/index.html`| Self-contained auto-refreshing web dashboard.                  |
 | `checks.test.js`   | `node:test` unit tests (stubbed `fetch`, no network).          |
+| `package.json`     | Marks the tool as ESM (`type: module`) and defines npm scripts.|
 
 ## Current beta findings (snapshot)
 

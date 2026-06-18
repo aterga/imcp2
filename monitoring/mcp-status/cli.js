@@ -38,9 +38,17 @@ const parseArgs = (argv) => {
       case "--ii":
         opts.ii = takeValue(arg, argv[++i]);
         break;
-      case "--timeout":
-        opts.timeout = takeValue(arg, argv[++i]);
+      case "--timeout": {
+        const value = takeValue(arg, argv[++i]);
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms <= 0) {
+          throw new Error(
+            `Invalid value for --timeout: ${value} (expected a positive number of milliseconds)`,
+          );
+        }
+        opts.timeout = value;
         break;
+      }
       case "--json":
         opts.json = true;
         break;

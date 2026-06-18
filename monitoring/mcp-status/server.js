@@ -46,6 +46,35 @@ const defaults = {
   iiOrigin: argValue("--ii"),
 };
 
+// `/api/status` runs the full probe suite — which includes a dynamic OAuth
+// client registration against the monitored server — so re-running it on every
+// request (multiple open tabs, rapid refreshes, a publicly reachable URL) would
+// multiply load and mint a fresh client each time. Cache the most recent report
+// for a short TTL and coalesce concurrent requests into a single in-flight run.
+const ttlEnv = Number(process.env.MCP_STATUS_CACHE_TTL_MS);
+const CACHE_TTL_MS = Number.isFinite(ttlEnv) && ttlEnv > 0 ? ttlEnv : 15_000;
+/** @type {{ at: number, report: import("./checks.js").DashboardReport | null }} */
+let cache = { at: 0, report: null };
+/** @type {Promise<import("./checks.js").DashboardReport> | null} */
+let inFlight = null;
+
+const getReport = () => {
+  if (cache.report && Date.now() - cache.at < CACHE_TTL_MS) {
+    return Promise.resolve(cache.report);
+  }
+  if (!inFlight) {
+    inFlight = runDashboard(defaults)
+      .then((report) => {
+        cache = { at: Date.now(), report };
+        return report;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  }
+  return inFlight;
+};
+
 const sendJson = (res, code, body) => {
   const payload = JSON.stringify(body);
   res.writeHead(code, {
@@ -84,7 +113,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/status") {
-      const report = await runDashboard(defaults);
+      const report = await getReport();
       sendJson(res, report.overall === "fail" ? 503 : 200, report);
       return;
     }

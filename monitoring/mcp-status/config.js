@@ -154,11 +154,18 @@ export const resolveConfig = (overrides = {}) => {
     iiOriginSource = iiOrigin ? "derived" : "none";
   }
 
-  const timeoutMs =
+  // Coerce the configured timeout to a positive, finite number of milliseconds.
+  // An unset/garbage env var (e.g. "abc") would otherwise yield NaN and later
+  // make AbortSignal.timeout() throw at probe time, so fall back to the default.
+  const rawTimeout =
     overrides.timeoutMs ??
     (process.env.MCP_STATUS_TIMEOUT_MS
       ? Number(process.env.MCP_STATUS_TIMEOUT_MS)
       : DEFAULT_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(rawTimeout) && rawTimeout > 0
+      ? rawTimeout
+      : DEFAULT_TIMEOUT_MS;
 
   return { mcpOrigin, iiOrigin, iiOriginSource, timeoutMs };
 };
