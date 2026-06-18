@@ -169,11 +169,12 @@ mcp_get_account_delegation :
 - Derived delegations are cached per `(session, domain)` and reused until they
   near expiry, then re-derived.
 
-> **Status:** the standing-credential connect flow is implemented against II's
-> existing `/mcp` delegation flow, so it works today. The two `mcp_*_account_delegation`
-> canister methods used for on-demand app delegations are **not deployed yet** —
-> the server is built against their candid contract, so that round-trip can't be
-> exercised until the II side lands and is deployed to the configured `II_URL`.
+> **Status:** the standing-credential connect flow runs against II's existing
+> `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
+> for on-demand app delegations land in
+> [dfinity/internet-identity#4034](https://github.com/dfinity/internet-identity/pull/4034);
+> the on-demand path works once that II build is deployed to the configured
+> `II_URL` (the server is built against the same candid contract).
 
 ## Roadmap
 
