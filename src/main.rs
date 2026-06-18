@@ -91,6 +91,12 @@ struct CallCanisterArgs {
     /// derived on demand for this connection. Omit to call anonymously.
     #[serde(default)]
     domain: Option<String>,
+    /// Optional Candid service definition (`.did` text) for the canister. Used to
+    /// encode the args to the method's declared types and decode the reply, for
+    /// when the canister's own `candid:service` metadata can't be read (e.g.
+    /// access-restricted) — get it from get_candid, or ask the user for it.
+    #[serde(default)]
+    candid: Option<String>,
 }
 
 fn default_args() -> String {
@@ -155,7 +161,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed."
     )]
     async fn call_canister(
         &self,
@@ -165,6 +171,7 @@ impl IcTools {
             args,
             is_query,
             domain,
+            candid,
         }): Parameters<CallCanisterArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
@@ -172,7 +179,10 @@ impl IcTools {
             Ok(p) => p,
             Err(e) => return Ok(err(format!("invalid canister id: {e}"))),
         };
-        let arg_bytes = match self.encode_args(principal, &method, &args).await {
+        // The interface to encode/decode against: the canister's own
+        // candid:service if exposed, else the caller-supplied `candid`.
+        let did = self.resolve_did(principal, candid.as_deref()).await;
+        let arg_bytes = match encode_args(did.as_deref(), &method, &args) {
             Ok(b) => b,
             Err(e) => return Ok(err(e)),
         };
@@ -204,8 +214,8 @@ impl IcTools {
             Ok(b) => b,
             Err(e) => return Ok(err(format!("call failed: {e}"))),
         };
-        // Decode against the canister's Candid interface so field names are recovered.
-        Ok(ok(self.decode_reply(principal, &method, &reply_bytes).await))
+        // Decode against the Candid interface so field names are recovered.
+        Ok(ok(decode_reply(did.as_deref(), &method, &reply_bytes)))
     }
 
     #[tool(
@@ -265,29 +275,13 @@ impl IcTools {
 }
 
 impl IcTools {
-    /// Decode a reply to textual Candid, preferring the canister's Candid
-    /// interface so field names are recovered; fall back to type-less decoding.
-    async fn decode_reply(&self, canister: Principal, method: &str, bytes: &[u8]) -> String {
-        if let Some(text) = self.decode_with_interface(canister, method, bytes).await {
-            return text;
+    /// The interface to encode/decode against: the canister's own
+    /// `candid:service` if exposed, else the caller-supplied `candid`.
+    async fn resolve_did(&self, canister: Principal, provided: Option<&str>) -> Option<String> {
+        if let Some(did) = self.candid_service(canister).await {
+            return Some(did);
         }
-        match IDLArgs::from_bytes(bytes) {
-            Ok(decoded) => decoded.to_string(),
-            Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
-        }
-    }
-
-    /// Type-aware decode: fetch `candid:service`, look up the method's return
-    /// types, and decode against them. None if the canister exposes no interface
-    /// or anything fails (caller falls back to type-less decoding).
-    async fn decode_with_interface(
-        &self,
-        canister: Principal,
-        method: &str,
-        bytes: &[u8],
-    ) -> Option<String> {
-        let did = self.candid_service(canister).await?;
-        decode_bytes_with_did(&did, method, bytes)
+        provided.map(str::to_string)
     }
 
     /// The canister's `candid:service` interface (`.did` text), if exposed.
@@ -299,34 +293,42 @@ impl IcTools {
             .ok()?;
         String::from_utf8(raw).ok()
     }
+}
 
-    /// Encode textual Candid args to bytes. Prefer the method's declared
-    /// parameter types from the canister's interface, so plain literals coerce to
-    /// what the method expects (e.g. `42` -> `nat64`, `1` -> `float64`, `opt`/
-    /// `vec` element types) and no `: type` annotations are needed. Fall back to
-    /// type-less inference only when the interface can't be read (then numeric
-    /// literals default to `int`/`float64` and must be annotated — see the
-    /// `candid://textual-syntax` resource).
-    async fn encode_args(
-        &self,
-        canister: Principal,
-        method: &str,
-        args_text: &str,
-    ) -> Result<Vec<u8>, String> {
-        let parsed = candid_parser::parse_idl_args(args_text)
-            .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
-        if let Some(did) = self.candid_service(canister).await {
-            if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(&did).load() {
-                if let Ok(func) = env.get_method(&actor, method) {
-                    return parsed
-                        .to_bytes_with_types(&env, &func.args)
-                        .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
-                }
+/// Encode textual Candid args to bytes. With `did` (the canister interface),
+/// coerce the args to the method's declared parameter types — so plain literals
+/// land as the method expects (`42` -> `nat64`, `1` -> `float64`, `opt`/`vec`
+/// element types) with no `: type` annotations. Without it (interface
+/// unreadable and no `candid` supplied), fall back to type-less inference, where
+/// numeric literals default to `int`/`float64` and must be annotated (see the
+/// `candid://textual-syntax` resource).
+fn encode_args(did: Option<&str>, method: &str, args_text: &str) -> Result<Vec<u8>, String> {
+    let parsed = candid_parser::parse_idl_args(args_text)
+        .map_err(|e| format!("could not parse args `{args_text}`: {e}"))?;
+    if let Some(did) = did {
+        if let Ok((env, Some(actor))) = candid_parser::utils::CandidSource::Text(did).load() {
+            if let Ok(func) = env.get_method(&actor, method) {
+                return parsed
+                    .to_bytes_with_types(&env, &func.args)
+                    .map_err(|e| format!("args don't match `{method}`'s Candid signature: {e}"));
             }
         }
-        parsed
-            .to_bytes()
-            .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+    }
+    parsed
+        .to_bytes()
+        .map_err(|e| format!("could not encode args `{args_text}`: {e}"))
+}
+
+/// Decode reply `bytes` to textual Candid. With `did`, decode against the
+/// method's declared return types so record/variant field names are recovered;
+/// otherwise (or on any failure) fall back to type-less decoding.
+fn decode_reply(did: Option<&str>, method: &str, bytes: &[u8]) -> String {
+    if let Some(text) = did.and_then(|d| decode_bytes_with_did(d, method, bytes)) {
+        return text;
+    }
+    match IDLArgs::from_bytes(bytes) {
+        Ok(decoded) => decoded.to_string(),
+        Err(e) => format!("(call succeeded but reply is not decodable as Candid: {e})"),
     }
 }
 
