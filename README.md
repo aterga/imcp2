@@ -11,7 +11,9 @@ encoding/decoding and signing against the IC via
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance |
+| `discover_canisters` | `domain` | Canister ids behind a web domain (frontend via `x-ic-canister-id`; backend via `/env.json` + JS-bundle mining), each with provenance and its IC dashboard label/type where known |
+| `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
+| `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
 | `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
@@ -21,13 +23,22 @@ of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
 backend candidates mined from `/env.json` + the JS bundle (pick by label, prefer
 production/`IC_` ids, confirm with `get_candid`).
 
-`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`)
-to call as your account at that app. For a domain, the server mints a
-**short-lived (≤5 min) account delegation on demand** from the connection's
-standing Internet Identity credential (see
-[Domain identities](#domain-identities-on-demand)) — there is no per-app sign-in
-step. `get_principal` returns that account's principal without a call. All these
-tools require a bearer token (see Auth).
+When the user names a **token, project, or service** (e.g. `ckUSDC`) rather than a
+website or id, `find_canister` resolves it via
+[`dashboard.internetcomputer.org`](https://dashboard.internetcomputer.org)'s public
+APIs — the ICRC token registry and the SNS catalog — to the matching canister id(s).
+`lookup_canister` goes the other way: given a bare id, it returns the dashboard's
+label, type, controllers, subnet, and module hash, so a raw principal becomes an
+identified service. (`discover_canisters` results are annotated with these labels
+inline.) There is no public name-search over arbitrary canisters, so `find_canister`
+covers the IC's labelled services, which is where the meaningful ones live.
+
+`call_canister` runs anonymously by default; pass a `domain` (e.g. `oisy.com`) to
+call as your account at that app. For a domain, the server mints a **short-lived
+(≤5 min) account delegation on demand** from the connection's standing Internet
+Identity credential (see [Domain identities](#domain-identities-on-demand)) —
+there is no per-app sign-in step. `get_principal` returns that account's principal
+without a call. All these tools require a bearer token (see Auth).
 
 ## Connect from an MCP client
 
@@ -38,7 +49,7 @@ claude mcp add --transport http ic-poc https://YOUR-HOST/mcp
 ```
 
 Then run `/mcp` → **ic-poc** → authenticate: the browser is sent to **Internet
-Identity**'s `/mcp` flow, you sign in once, and the three tools become available
+Identity**'s `/mcp` flow, you sign in once, and the tools become available
 — that single login is the connection's standing credential. (Any MCP client
 with remote HTTP + OAuth support works.)
 

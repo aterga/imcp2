@@ -117,6 +117,19 @@ struct GetPrincipalArgs {
     domain: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FindCanisterArgs {
+    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
+    /// "OpenChat".
+    query: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct LookupCanisterArgs {
+    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
+    canister_id: String,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
@@ -251,24 +264,84 @@ impl IcTools {
             Ok(found) if !found.is_empty() => {
                 let mut out = format!("Canisters discovered for {domain}:\n");
                 for f in &found {
+                    // Dashboard identity (name/type), filled in during discovery.
+                    let identity = match (&f.name, &f.kind) {
+                        (Some(n), Some(k)) => format!("  «{n}» ({k})"),
+                        (Some(n), None) => format!("  «{n}»"),
+                        _ => String::new(),
+                    };
                     out.push_str(&format!(
-                        "- {}{} [{}]\n",
+                        "- {}{}{} [{}]\n",
                         f.canister_id,
                         f.label.as_deref().map(|l| format!("  — {l}")).unwrap_or_default(),
+                        identity,
                         f.sources.join(", "),
                     ));
                 }
                 out.push_str(
                     "\nThe `header` (x-ic-canister-id) entry is the frontend/asset canister and is \
                      authoritative. Others come from env.json or the JS bundle and may include \
-                     multiple environments (prefer the production/IC ids). No authoritative \
-                     reverse lookup exists — confirm an interface with get_candid before calling.",
+                     multiple environments (prefer the production/IC ids). A «name» (type) is the \
+                     IC dashboard's label for that id. No authoritative reverse lookup exists — \
+                     confirm an interface with get_candid before calling.",
                 );
                 Ok(ok(out))
             }
             Ok(_) => Ok(ok(format!(
                 "No IC canisters found for {domain} — is it served from the Internet Computer?"
             ))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
+        description = "Find Internet Computer canisters by NAME. Searches the IC dashboard's service registries — the ICRC token ledgers (e.g. ckBTC, ckETH, ckUSDC, SNS tokens) by symbol/name, and the SNS project catalog by name — and returns matching canister ids. Use this when the user names a token, project, or service (e.g. \"ckUSDC\") rather than a canister id; then confirm with get_candid and call methods with call_canister. (No public name-search exists over arbitrary canisters; this covers the IC's labelled services.)"
+    )]
+    async fn find_canister(
+        &self,
+        Parameters(FindCanisterArgs { query }): Parameters<FindCanisterArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match discover::search_by_name(&query).await {
+            Ok(matches) if !matches.is_empty() => {
+                let mut out = format!("Canisters matching \"{query}\":\n");
+                for m in &matches {
+                    out.push_str(&format!(
+                        "- {} — {} [{}]{}\n",
+                        m.canister_id,
+                        m.name,
+                        m.kind,
+                        m.note.as_deref().map(|n| format!("  — {n}")).unwrap_or_default(),
+                    ));
+                }
+                out.push_str(
+                    "\nConfirm an interface with get_candid, then call methods with call_canister. \
+                     For an SNS match the id is the project root — lookup_canister it to learn more.",
+                );
+                Ok(ok(out))
+            }
+            Ok(_) => Ok(ok(format!(
+                "No named canisters found matching \"{query}\". This searches known tokens (ICRC \
+                 ledgers) and SNS projects, so an arbitrary canister won't appear unless it's a \
+                 labelled service. If you have a website, try discover_canisters; if you already \
+                 have a canister id, try lookup_canister or get_candid."
+            ))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
+        description = "Identify what an Internet Computer canister IS, from the IC dashboard: its label/name (e.g. \"ICP Ledger\"), type (e.g. \"ledger\"), controllers, hosting subnet, module hash, language, and latest upgrade proposal. Use this to make sense of a bare canister id — e.g. one returned by discover_canisters."
+    )]
+    async fn lookup_canister(
+        &self,
+        Parameters(LookupCanisterArgs { canister_id }): Parameters<LookupCanisterArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = match discover::http_client() {
+            Ok(c) => c,
+            Err(e) => return Ok(err(e)),
+        };
+        match discover::lookup_canister(&client, &canister_id).await {
+            Ok(info) => Ok(ok(format_canister_info(&info))),
             Err(e) => Ok(err(e)),
         }
     }
@@ -352,6 +425,28 @@ fn authed_session(ctx: &RequestContext<RoleServer>) -> Option<auth::AuthedSessio
         .cloned()
 }
 
+/// Log each inbound request: method, path, response status, and latency — gives
+/// visibility into what external MCP clients probe (discovery URLs, unknown
+/// paths) at `RUST_LOG=info`. The query string is never logged, keeping the
+/// OAuth `?code=` out of logs.
+async fn log_request(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!(
+        %method,
+        %path,
+        status = resp.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "http request"
+    );
+    resp
+}
+
 /// Perform a query or update call and return the raw Candid reply bytes.
 async fn raw_call(
     agent: &Agent,
@@ -381,14 +476,17 @@ impl ServerHandler for IcTools {
              resource (the value syntax these tools use); `candid://reference` has the full type \
              reference. When the user names a website/domain instead of a canister id, use \
              `discover_canisters` to find the canister(s) behind it (frontend via header, \
-             backend via env.json/JS bundle). `get_candid` fetches a canister's Candid interface. \
-             `call_canister` calls a method with textual Candid in/out: omit `domain` to call \
-             anonymously, or pass an application domain (e.g. domain=\"oisy.com\") to call as your \
-             account at that app — a short-lived (<=5 min) account delegation for it is minted ON \
-             DEMAND from this connection's standing Internet Identity credential, no extra sign-in. \
-             `get_principal` returns the principal you act as at an application `domain` \
-             without making a call — use it when a flow just needs the principal (e.g. to look up \
-             a balance or account). The standing credential is obtained when you connect \
+             backend via env.json/JS bundle). When they name a TOKEN, PROJECT or SERVICE (e.g. \
+             \"ckUSDC\"), use `find_canister` to look it up by name in the IC dashboard's \
+             registries and get its canister id. `lookup_canister(id)` tells you what a bare \
+             canister id IS (dashboard label, type, controllers, subnet). `get_candid` fetches a \
+             canister's Candid interface. `call_canister` calls a method with textual Candid \
+             in/out: omit `domain` to call anonymously, or pass an application domain (e.g. \
+             domain=\"oisy.com\") to call as your account at that app — a short-lived (<=5 min) \
+             account delegation for it is minted ON DEMAND from this connection's standing \
+             Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
+             you act as at an application `domain` without making a call (e.g. to look up a \
+             balance or account). The standing credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires."
                 .to_string(),
         )
@@ -433,6 +531,35 @@ impl ServerHandler for IcTools {
     }
 }
 
+/// Render an IC dashboard canister identity as readable text for lookup_canister.
+fn format_canister_info(info: &discover::CanisterInfo) -> String {
+    let mut s = format!("Canister {}\n", info.canister_id);
+    s.push_str(&format!(
+        "- name: {}\n",
+        info.name.as_deref().unwrap_or("(unlabelled — not a known/named canister)")
+    ));
+    if let Some(t) = &info.canister_type {
+        s.push_str(&format!("- type: {t}\n"));
+    }
+    if let Some(sub) = &info.subnet_id {
+        s.push_str(&format!("- subnet: {sub}\n"));
+    }
+    if !info.controllers.is_empty() {
+        s.push_str(&format!("- controllers: {}\n", info.controllers.join(", ")));
+    }
+    if let Some(lang) = &info.language {
+        s.push_str(&format!("- language: {lang}\n"));
+    }
+    if let Some(mh) = &info.module_hash {
+        s.push_str(&format!("- module hash: {mh}\n"));
+    }
+    if let Some(p) = info.latest_upgrade_proposal {
+        s.push_str(&format!("- latest upgrade: NNS proposal {p}\n"));
+    }
+    s.push_str("\nFetch its interface with get_candid, then call methods with call_canister.");
+    s
+}
+
 fn ok(text: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
@@ -446,7 +573,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call). All speak textual Candid.</p>
 </body></html>"#;
 
 #[tokio::main]
@@ -507,6 +634,19 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(auth::protected_resource_metadata),
         )
+        // Path-aware protected-resource metadata (RFC 9728 §3.1): the resource
+        // `…/mcp` has a path, so its metadata canonically lives at
+        // `/.well-known/oauth-protected-resource/mcp`. Clients that follow the
+        // `resource_metadata` hint use the root doc above; spec-strict clients
+        // derive this `/mcp`-suffixed URL. We deliberately do NOT add a
+        // `/mcp`-suffixed *authorization-server* doc: our AS issuer is `base_url()`
+        // (no path), so per RFC 8414 a strict client requesting the suffixed AS
+        // doc would reject it on issuer mismatch — the AS is correctly discovered
+        // at the root via `authorization_servers` in the protected-resource doc.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            axum::routing::get(auth::protected_resource_metadata),
+        )
         .route("/oauth/authorize", axum::routing::get(auth::authorize))
         .route("/oauth/connect/callback", axum::routing::post(auth::connect_callback))
         .route("/oauth/token", axum::routing::post(auth::token))
@@ -514,10 +654,38 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(store.clone());
 
+    // When this process started — i.e. when the deployment last (re)started.
+    // Every deploy restarts the service, so this is the "last redeployment" time.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { axum::response::Html(INDEX_HTML) }))
+        // Unauthenticated build/version probe so operators and the status
+        // dashboard can confirm exactly which deployment is live: the running
+        // commit (baked in at build time via GIT_SHA), the build time
+        // (BUILD_TIME), and when this process started (= last redeployment).
+        // Timestamps are Unix epoch seconds (or null when unknown).
+        .route(
+            "/version",
+            axum::routing::get(move || async move {
+                axum::Json(serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "commit": option_env!("GIT_SHA").unwrap_or("unknown"),
+                    "built_at": option_env!("BUILD_TIME").and_then(|s| s.parse::<u64>().ok()),
+                    "started_at": started_at,
+                }))
+            }),
+        )
         .merge(oauth)
-        .merge(protected_mcp);
+        .merge(protected_mcp)
+        // Log every inbound request (method, path, status, latency) so we can see
+        // what external clients actually hit — discovery probes, unknown paths,
+        // etc. Only the path is logged, never the query string, so single-use
+        // secrets (`?code=`, `?c=`) don't land in logs.
+        .layer(axum::middleware::from_fn(log_request));
 
     let bind = bind_address();
     let listener = tokio::net::TcpListener::bind(&bind).await?;
