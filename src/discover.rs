@@ -216,10 +216,19 @@ fn sns_api() -> String {
 }
 
 fn api_base(var: &str, default: &str) -> String {
-    std::env::var(var)
-        .unwrap_or_else(|_| default.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    resolve_base(std::env::var(var).ok(), default)
+}
+
+/// Use the configured base when it's non-blank, else the default — so a set but
+/// empty/whitespace `IC_*_API` can't produce a scheme-less or "/api/..." URL.
+/// Trailing slashes are trimmed so callers can append `/api/...` uniformly.
+fn resolve_base(configured: Option<String>, default: &str) -> String {
+    let trimmed = configured.as_deref().unwrap_or("").trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        default.trim_end_matches('/').to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Shared HTTP client for discovery + dashboard calls. Short-ish timeout since
@@ -307,14 +316,29 @@ pub async fn lookup_canister(client: &reqwest::Client, id: &str) -> Result<Canis
         return Err(format!("invalid canister id: {id}"));
     }
     let url = format!("{}/api/v3/canisters/{id}", dashboard_api());
-    let body = fetch_text(client, &url).await.map_err(|e| {
-        // A 404 just means the dashboard has no record of this id.
-        if e.contains("404") {
-            format!("the IC dashboard has no record for {id}")
-        } else {
-            e
-        }
-    })?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("dashboard request failed: {e}"))?;
+    // "No dashboard record" (404) is expected for many principals — return a
+    // bare, unlabelled identity rather than an error so the tool still responds.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CanisterInfo {
+            canister_id: id.to_string(),
+            ..Default::default()
+        });
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "dashboard returned HTTP {} for {id}",
+            resp.status().as_u16()
+        ));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("could not read dashboard response: {e}"))?;
     let raw: RawCanister = serde_json::from_str(&body)
         .map_err(|e| format!("could not parse dashboard response: {e}"))?;
     Ok(raw.into())
@@ -370,12 +394,20 @@ struct RawSns {
 /// ledger registry and SNS catalog, then filters locally — there is no public
 /// name-search over all canisters.
 pub async fn search_by_name(query: &str) -> Result<Vec<Match>, String> {
+    // Nothing to search for — skip the network round-trips entirely.
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let client = http_client()?;
     // Both registries are small (≈60 entries each); limit=100 captures them all
-    // in one request. The API rejects very large limits (HTTP 422).
-    let ledgers = fetch_text(&client, &format!("{}/api/v1/ledgers?limit=100", icrc_api())).await;
-    let snses =
-        fetch_text(&client, &format!("{}/api/v1/snses?limit=100&offset=0", sns_api())).await;
+    // in one request. The API rejects very large limits (HTTP 422). Fetch the two
+    // independent registries concurrently to keep this interactive tool snappy.
+    let ledgers_url = format!("{}/api/v1/ledgers?limit=100", icrc_api());
+    let snses_url = format!("{}/api/v1/snses?limit=100&offset=0", sns_api());
+    let (ledgers, snses) = tokio::join!(
+        fetch_text(&client, &ledgers_url),
+        fetch_text(&client, &snses_url),
+    );
 
     // Best-effort: tolerate one registry being down, but not both.
     if ledgers.is_err() && snses.is_err() {
@@ -496,6 +528,25 @@ mod tests {
             .expect("lookup");
         assert_eq!(info.canister_type.as_deref(), Some("ledger"));
         assert!(info.name.as_deref().unwrap_or_default().contains("ckUSDC"));
+    }
+
+    // A set-but-blank IC_*_API env var must not yield a scheme-less base URL.
+    #[test]
+    fn resolve_base_falls_back_on_blank_or_unset() {
+        let default = "https://d.example";
+        assert_eq!(resolve_base(None, default), default);
+        assert_eq!(resolve_base(Some("".into()), default), default);
+        assert_eq!(resolve_base(Some("   ".into()), default), default);
+        assert_eq!(
+            resolve_base(Some("https://x.example/".into()), default),
+            "https://x.example"
+        );
+    }
+
+    // A blank query short-circuits before any network call.
+    #[tokio::test]
+    async fn search_by_name_blank_is_empty_without_network() {
+        assert!(search_by_name("   ").await.unwrap().is_empty());
     }
 
     // Name search filters the bounded token + SNS registries (offline fixtures).
