@@ -24,11 +24,46 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Registry origin (no trailing slash). Override with `SKILLS_URL`.
 fn skills_base() -> String {
-    std::env::var("SKILLS_URL")
-        .ok()
+    resolve_skills_base(std::env::var("SKILLS_URL").ok())
+}
+
+/// Pure resolver for the registry origin (split out so it's testable without
+/// mutating the process-global `SKILLS_URL`). A set-but-blank value falls back
+/// to the default; trailing slashes are trimmed.
+fn resolve_skills_base(configured: Option<String>) -> String {
+    configured
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| SKILLS_BASE_DEFAULT.to_string())
+}
+
+/// The URL to fetch a skill's `SKILL.md` from. The manifest's `urls.markdown` is
+/// honoured ONLY when it stays on the configured registry (same host, and an
+/// https — or base-scheme — URL); otherwise we fall back to the conventional
+/// `{base}/.well-known/skills/<name>/SKILL.md`. This keeps a compromised or
+/// MITM'd manifest from turning the fetch into an SSRF primitive (e.g. cloud
+/// metadata IPs) and preserves the expectation that skills come from the
+/// configured origin.
+fn markdown_url(name: &str, candidate: &str) -> String {
+    markdown_url_for_base(&skills_base(), name, candidate)
+}
+
+/// Pure core of [`markdown_url`] (base passed in, so it's testable without env).
+fn markdown_url_for_base(base: &str, name: &str, candidate: &str) -> String {
+    let fallback = format!("{base}/.well-known/skills/{name}/SKILL.md");
+    let Ok(base_url) = url::Url::parse(base) else {
+        return fallback;
+    };
+    match url::Url::parse(candidate) {
+        Ok(u)
+            if u.host_str().is_some()
+                && u.host_str() == base_url.host_str()
+                && (u.scheme() == "https" || u.scheme() == base_url.scheme()) =>
+        {
+            candidate.to_string()
+        }
+        _ => fallback,
+    }
 }
 
 /// One entry from the skills manifest. Optional fields default so a manifest
@@ -118,10 +153,9 @@ impl SkillsCatalog {
                 "no skill named `{name}` — call list_ic_skills to see the available skills"
             ));
         }
-        // Prefer the manifest's markdown URL; fall back to the conventional path.
-        let url = entry
-            .and_then(|e| (!e.urls.markdown.is_empty()).then(|| e.urls.markdown.clone()))
-            .unwrap_or_else(|| format!("{}/.well-known/skills/{name}/SKILL.md", skills_base()));
+        // Use the manifest's markdown URL only when it stays on the configured
+        // registry; otherwise fall back to the conventional path (see markdown_url).
+        let url = markdown_url(name, entry.map(|e| e.urls.markdown.as_str()).unwrap_or(""));
         let client = crate::discover::http_client()?;
         let resp = client
             .get(&url)
@@ -193,10 +227,46 @@ mod tests {
         assert!(rendered.contains("- icp-cli — ICP CLI:"), "{rendered}");
     }
 
+    // Pure resolver — no process-global env mutation, so it can't race other tests.
     #[test]
-    fn skills_base_default_and_override() {
-        std::env::remove_var("SKILLS_URL");
-        assert_eq!(skills_base(), "https://skills.internetcomputer.org");
+    fn resolve_skills_base_default_and_override() {
+        let default = "https://skills.internetcomputer.org";
+        assert_eq!(resolve_skills_base(None), default);
+        assert_eq!(resolve_skills_base(Some(String::new())), default);
+        assert_eq!(resolve_skills_base(Some("   ".into())), default);
+        assert_eq!(
+            resolve_skills_base(Some("https://x.example/".into())),
+            "https://x.example"
+        );
+    }
+
+    // markdown_url_for_base honours same-origin https URLs and falls back
+    // otherwise, so a tampered manifest can't redirect the fetch off the
+    // configured registry. Pure (base passed in) → no env mutation.
+    #[test]
+    fn markdown_url_only_trusts_same_origin() {
+        let base = "https://skills.internetcomputer.org";
+        let fallback = "https://skills.internetcomputer.org/.well-known/skills/motoko/SKILL.md";
+
+        // Same host + https → trusted as-is.
+        let good = "https://skills.internetcomputer.org/.well-known/skills/motoko/SKILL.md";
+        assert_eq!(markdown_url_for_base(base, "motoko", good), good);
+        // Different host → fall back to the configured origin (no SSRF).
+        assert_eq!(markdown_url_for_base(base, "motoko", "https://evil.example/x"), fallback);
+        // Internal/metadata IP → fall back.
+        assert_eq!(
+            markdown_url_for_base(base, "motoko", "http://169.254.169.254/latest/meta-data"),
+            fallback
+        );
+        // Non-web scheme → fall back.
+        assert_eq!(markdown_url_for_base(base, "motoko", "file:///etc/passwd"), fallback);
+        // Empty (no manifest URL) → fall back.
+        assert_eq!(markdown_url_for_base(base, "motoko", ""), fallback);
+        // A local http override accepts same-host http (base scheme) URLs.
+        assert_eq!(
+            markdown_url_for_base("http://localhost:8080", "motoko", "http://localhost:8080/x.md"),
+            "http://localhost:8080/x.md"
+        );
     }
 
     // Live network: the real registry parses into our (subset) structs and the
