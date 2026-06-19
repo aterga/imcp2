@@ -14,6 +14,8 @@ mod auth;
 mod delegation;
 mod discover;
 mod identities;
+mod management;
+mod skills;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::{Agent, Identity};
@@ -39,6 +41,8 @@ const IC_URL: &str = "https://icp-api.io";
 /// tool here speaks textual Candid; the full type reference backs it up.
 const CANDID_TEXTUAL_URI: &str = "candid://textual-syntax";
 const CANDID_REFERENCE_URI: &str = "candid://reference";
+/// URI scheme for IC skills exposed as MCP resources (`skill://<name>`).
+const SKILL_URI_PREFIX: &str = "skill://";
 const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
 const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
 
@@ -130,19 +134,27 @@ struct LookupCanisterArgs {
     canister_id: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetSkillArgs {
+    /// Skill name, e.g. "motoko", "icp-cli", "cycles-management".
+    name: String,
+}
+
 #[derive(Clone)]
 struct IcTools {
     agent: Agent,
     identities: Identities,
+    skills: skills::SkillsCatalog,
     tool_router: ToolRouter<IcTools>,
 }
 
 #[tool_router]
 impl IcTools {
-    fn new(agent: Agent, identities: Identities) -> Self {
+    fn new(agent: Agent, identities: Identities, skills: skills::SkillsCatalog) -> Self {
         Self {
             agent,
             identities,
+            skills,
             tool_router: Self::tool_router(),
         }
     }
@@ -345,6 +357,196 @@ impl IcTools {
             Err(e) => Ok(err(e)),
         }
     }
+
+    // ---- ICP skills awareness ----------------------------------------------
+
+    #[tool(
+        description = "List the official Internet Computer skills — authoritative how-to guides for authoring and shipping IC apps (Motoko language, mops/icp CLIs, cycles management, stable memory & upgrades, security, DeFi, auth, …). Returns each skill's name and a one-line description. Load a skill's full instructions with get_ic_skill(name). Consult these BEFORE writing Motoko/Rust canister code, building, or deploying."
+    )]
+    async fn list_ic_skills(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.skills.list().await {
+            Ok(s) => Ok(ok(skills::SkillsCatalog::format_list(&s))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
+        description = "Fetch the full instructions (SKILL.md) of one Internet Computer skill by name (e.g. \"motoko\", \"icp-cli\", \"mops-cli\", \"cycles-management\", \"stable-memory\", \"canister-security\"). Call list_ic_skills first to see the available names. Use this to learn the exact, current way to do an IC task before doing it."
+    )]
+    async fn get_ic_skill(
+        &self,
+        Parameters(GetSkillArgs { name }): Parameters<GetSkillArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.skills.get(&name).await {
+            Ok(md) => Ok(ok(md)),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    // ---- Canister creation & management (as your standing II principal) -----
+
+    #[tool(
+        description = "Your cycles-ledger balance — the cycles that create_canister and top_up_canister spend. Acts as your Internet Identity principal (also printed). If it's empty, fund it first (e.g. via the icp CLI / cycles-management skill). Requires an authenticated session."
+    )]
+    async fn cycles_balance(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("checking your cycles balance needs an authenticated session".into())),
+        };
+        Ok(into_result(management::cycles_balance(&self.identities, &sid).await))
+    }
+
+    #[tool(
+        description = "Create and fund a NEW Internet Computer canister, paying from your cycles-ledger balance (as your Internet Identity). Specify the amount as `cycles` (exact) or `icp` (a decimal-ICP string like \"0.5\", converted to cycles at the network's current rate). Controllers default to your own principal. You must already hold cycles in the cycles ledger (check with cycles_balance; fund via the icp CLI / cycles-management skill). Returns the new canister id — then build your Wasm (see the motoko/icp-cli skills) and install it with install_code. Requires an authenticated session."
+    )]
+    async fn create_canister(
+        &self,
+        Parameters(args): Parameters<management::CreateCanisterArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("creating a canister needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::create_canister(&self.identities, &sid, args).await,
+        ))
+    }
+
+    #[tool(
+        description = "Add cycles to an existing canister, paying from your cycles-ledger balance. Specify `cycles` (exact) or `icp` (decimal-ICP string, converted at the current rate). Requires an authenticated session."
+    )]
+    async fn top_up_canister(
+        &self,
+        Parameters(args): Parameters<management::TopUpArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("topping up a canister needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::top_up_canister(&self.identities, &sid, args).await,
+        ))
+    }
+
+    #[tool(
+        description = "Install a compiled Wasm module on a canister you control (as your Internet Identity). Provide the module as `wasm_base64` (or `wasm_hex`); large modules are uploaded via the chunk store automatically. `mode` is \"install\" (default, empty canister), \"reinstall\" (wipe state), or \"upgrade\" (preserve stable memory). `arg` is the init/upgrade argument in textual Candid, e.g. \"()\". Build the Wasm in your own environment first (see the motoko / icp-cli / mops-cli skills). Requires an authenticated session."
+    )]
+    async fn install_code(
+        &self,
+        Parameters(args): Parameters<management::InstallCodeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("installing code needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::install_code(&self.identities, &sid, args).await,
+        ))
+    }
+
+    #[tool(
+        description = "Report a canister's status: run state, cycle balance, module hash, memory size, controllers, and allocations. Controller-only (acts as your Internet Identity). Requires an authenticated session."
+    )]
+    async fn canister_status(
+        &self,
+        Parameters(args): Parameters<management::CanisterRefArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("reading canister status needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::canister_status(&self.identities, &sid, args).await,
+        ))
+    }
+
+    #[tool(
+        description = "Update a canister's settings: controllers, compute/memory allocation, freezing threshold, reserved-cycles limit, wasm memory limit, or log visibility (\"controllers\"|\"public\"). Only the fields you pass are changed. WARNING: passing `controllers` REPLACES the whole set — include your own principal to remain a controller. Requires an authenticated session."
+    )]
+    async fn update_canister_settings(
+        &self,
+        Parameters(args): Parameters<management::UpdateSettingsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("updating settings needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::update_canister_settings(&self.identities, &sid, args).await,
+        ))
+    }
+
+    #[tool(description = "Start a stopped canister you control. Requires an authenticated session.")]
+    async fn start_canister(
+        &self,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("starting a canister needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::start_canister(&self.identities, &sid, &canister_id).await,
+        ))
+    }
+
+    #[tool(description = "Stop a running canister you control (required before deleting it). Requires an authenticated session.")]
+    async fn stop_canister(
+        &self,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("stopping a canister needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::stop_canister(&self.identities, &sid, &canister_id).await,
+        ))
+    }
+
+    #[tool(description = "Remove a canister's code and state, leaving it empty (it keeps its id and cycles). Acts as your Internet Identity. Requires an authenticated session.")]
+    async fn uninstall_code(
+        &self,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("uninstalling code needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::uninstall_code(&self.identities, &sid, &canister_id).await,
+        ))
+    }
+
+    #[tool(description = "Delete a canister permanently (irreversible — stop it first; remaining cycles are burned). Acts as your Internet Identity. Requires an authenticated session.")]
+    async fn delete_canister(
+        &self,
+        Parameters(management::CanisterRefArgs { canister_id }): Parameters<management::CanisterRefArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("deleting a canister needs an authenticated session".into())),
+        };
+        Ok(into_result(
+            management::delete_canister(&self.identities, &sid, &canister_id).await,
+        ))
+    }
 }
 
 impl IcTools {
@@ -513,7 +715,21 @@ impl ServerHandler for IcTools {
              Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
              you act as at an application `domain` without making a call (e.g. to look up a \
              balance or account). The standing credential is obtained when you connect \
-             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires."
+             (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires.\n\n\
+             To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
+             `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
+             (language), `mops-cli` (deps/build), `icp-cli` (build & deploy), `cycles-management` \
+             (ICP↔cycles & funding), `stable-memory` (upgrades) and `canister-security`. Compiling \
+             Motoko/Rust to Wasm happens in YOUR environment (guided by these skills); these tools \
+             then put it on chain. To CREATE and MANAGE canisters as your Internet Identity, use: \
+             `cycles_balance` (your cycles-ledger balance), `create_canister` (create + fund from \
+             that balance — amount in `cycles` or `icp`), `install_code` (install your compiled \
+             Wasm — base64 — single-shot or chunked), `canister_status`, `update_canister_settings`, \
+             `start_canister`/`stop_canister`/`uninstall_code`/`delete_canister`, and \
+             `top_up_canister`. These act as your standing II principal, which must hold cycles in \
+             the cycles ledger first (fund it via the icp CLI / cycles-management skill). So to \
+             \"build X and deploy a canister with Y ICP worth of cycles\": read the relevant skills, \
+             write & build the Wasm locally, `create_canister(icp=Y)`, then `install_code`."
                 .to_string(),
         )
     }
@@ -523,13 +739,29 @@ impl ServerHandler for IcTools {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
+        let mut resources = vec![
+            RawResource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)")
+                .no_annotation(),
+            RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
+                .no_annotation(),
+        ];
+        // Surface the IC skills as resources too (best-effort: if the registry is
+        // unreachable, the candid resources above still list). Each `skill://<name>`
+        // is read on demand in read_resource.
+        if let Ok(skills) = self.skills.list().await {
+            for s in skills {
+                let title = if s.title.is_empty() {
+                    format!("IC skill: {}", s.name)
+                } else {
+                    format!("IC skill: {}", s.title)
+                };
+                resources.push(
+                    RawResource::new(format!("{SKILL_URI_PREFIX}{}", s.name), title).no_annotation(),
+                );
+            }
+        }
         Ok(ListResourcesResult {
-            resources: vec![
-                RawResource::new(CANDID_TEXTUAL_URI, "Candid textual syntax (used by these tools)")
-                    .no_annotation(),
-                RawResource::new(CANDID_REFERENCE_URI, "Candid type reference (full spec)")
-                    .no_annotation(),
-            ],
+            resources,
             next_cursor: None,
             meta: None,
         })
@@ -540,6 +772,19 @@ impl ServerHandler for IcTools {
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        // Skills are fetched live by name; the candid references are static.
+        if let Some(name) = request.uri.strip_prefix(SKILL_URI_PREFIX) {
+            return match self.skills.get(name).await {
+                Ok(md) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    md,
+                    request.uri,
+                )])),
+                Err(e) => Err(McpError::resource_not_found(
+                    "resource_not_found",
+                    Some(serde_json::json!({ "uri": request.uri, "error": e })),
+                )),
+            };
+        }
         let body = match request.uri.as_str() {
             CANDID_TEXTUAL_URI => CANDID_TEXTUAL_MD,
             CANDID_REFERENCE_URI => CANDID_REFERENCE_MD,
@@ -594,12 +839,22 @@ fn err(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
 }
 
+/// Map a tool's `Result<String, String>` to a success/error `CallToolResult`.
+fn into_result(r: Result<String, String>) -> CallToolResult {
+    match r {
+        Ok(text) => ok(text),
+        Err(text) => err(text),
+    }
+}
+
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>IC MCP PoC</title></head>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
 <p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call). All speak textual Candid.</p>
+<p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
+<p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;
 
 #[tokio::main]
@@ -616,13 +871,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("built ic-agent against {IC_URL}");
 
     let identities = Identities::new();
+    let skills = skills::SkillsCatalog::new();
 
     let ct = tokio_util::sync::CancellationToken::new();
     let mcp = {
         let agent = agent.clone();
         let identities = identities.clone();
+        let skills = skills.clone();
         StreamableHttpService::new(
-            move || Ok(IcTools::new(agent.clone(), identities.clone())),
+            move || Ok(IcTools::new(agent.clone(), identities.clone(), skills.clone())),
             LocalSessionManager::default().into(),
             // Stateless + plain-JSON responses: our tools are pure request/response
             // with no server-initiated messages, and this is the most compatible

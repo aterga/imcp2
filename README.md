@@ -17,6 +17,15 @@ encoding/decoding and signing against the IC via
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
 | `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
+| `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
+| `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
+| `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
+| `create_canister` | `cycles?` / `icp?`, `controllers?`, `subnet?` | Create + fund a new canister from your cycles-ledger balance; returns the new canister id |
+| `install_code` | `canister_id`, `wasm_base64` / `wasm_hex`, `mode?`, `arg?` | Install/reinstall/upgrade a Wasm module (single-shot, or via the chunk store for large modules) |
+| `canister_status` | `canister_id` | Run state, cycle balance, module hash, memory, controllers, allocations |
+| `update_canister_settings` | `canister_id`, `controllers?`, allocations, `freezing_threshold?`, `log_visibility?`, … | Update a canister's settings |
+| `start_canister` / `stop_canister` / `uninstall_code` / `delete_canister` | `canister_id` | Canister lifecycle |
+| `top_up_canister` | `canister_id`, `cycles?` / `icp?` | Add cycles to an existing canister from your cycles-ledger balance |
 
 `discover_canisters` is the entry point when the user names a **website** instead
 of a canister id: frontend via the `x-ic-canister-id` header (authoritative),
@@ -39,6 +48,39 @@ call as your account at that app. For a domain, the server mints a **short-lived
 Identity credential (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
 without a call. All these tools require a bearer token (see Auth).
+
+### Skills awareness
+
+`list_ic_skills` / `get_ic_skill` expose the official Internet Computer
+[skills](https://skills.internetcomputer.org) — authoritative, current how-to
+guides for authoring and shipping IC apps (the Motoko language, the `mops` and
+`icp` CLIs, cycles management, stable memory & upgrades, canister security, DeFi,
+auth, …). The catalogue is fetched live from the registry's manifest
+(`/api/skills.json`, cached ~15 min) and each skill's `SKILL.md` on demand;
+nothing is bundled, so the agent always sees the current skills. They are also
+listed as MCP **resources** (`skill://<name>`) alongside the `candid://`
+references. Override the registry origin with `SKILLS_URL`.
+
+### Creating & managing canisters
+
+The management tools let the agent act **on chain as your standing Internet
+Identity principal** — a stable per-connection identity (the one returned when you
+authenticate). Because a user ingress message cannot attach cycles, creation and
+top-ups draw from your **cycles-ledger** balance (`um5iw-rqaaa-aaaaq-qaaba-cai`):
+fund that principal first (e.g. via the `icp` CLI / `cycles-management` skill),
+check it with `cycles_balance`, then `create_canister` (amount in `cycles`, or in
+`icp` converted at the CMC's current rate). Lifecycle calls
+(`install_code`, `canister_status`, `update_canister_settings`,
+`start`/`stop`/`uninstall`/`delete`) go to the management canister (`aaaaa-aa`)
+with the effective canister id set to the target. `install_code` takes the
+compiled Wasm as base64/hex and uploads it via the chunk store automatically when
+it exceeds the single-message limit.
+
+Together these make the end-to-end flow work: *"create a Motoko canister that does
+X and deploy a new canister with Y ICP worth of cycles"* → the agent reads the
+relevant skills, writes and **builds** the Wasm in its own environment, then
+`create_canister(icp = Y)` and `install_code`. (Compiling Motoko/Rust to Wasm
+happens in the agent's environment, not in this server.)
 
 ## Connect from an MCP client
 

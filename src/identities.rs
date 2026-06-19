@@ -209,7 +209,10 @@ impl Identities {
     /// session key`, issued for the MCP origin), as an `ic-agent` identity the
     /// backend signs II's account-derivation calls with. The backend's private
     /// key signs locally; it is never transmitted.
-    async fn standing_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
+    ///
+    /// Public so the canister-management tools can act as this stable per-user
+    /// principal (the user's controller/funder identity).
+    pub async fn standing_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
         let sessions = self.sessions.read().await;
         let s = sessions.get(session_id).ok_or("no such session")?;
         let standing = s.standing.as_ref().ok_or(
