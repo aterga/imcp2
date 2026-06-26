@@ -16,6 +16,7 @@ mod discover;
 mod identities;
 mod management;
 mod skills;
+mod tunnel;
 
 use candid::{types::value::IDLArgs, Principal};
 use ic_agent::{Agent, Identity};
@@ -46,10 +47,83 @@ const SKILL_URI_PREFIX: &str = "skill://";
 const CANDID_TEXTUAL_MD: &str = include_str!("../static/candid-textual-syntax.md");
 const CANDID_REFERENCE_MD: &str = include_str!("../static/candid-reference.md");
 
+/// Port the server listens on. Honours `$PORT` (set by most PaaS), default 8000.
+fn port() -> String {
+    std::env::var("PORT").unwrap_or_else(|_| "8000".to_string())
+}
+
 /// Bind address. Honours `$PORT` (set by most PaaS), defaulting to 8000.
 fn bind_address() -> String {
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
-    format!("0.0.0.0:{port}")
+    format!("0.0.0.0:{}", port())
+}
+
+/// This program's invoked name (basename of argv[0]), for help/usage text.
+/// Falls back to "imcp" — the name of the published binary.
+fn prog_name() -> String {
+    std::env::args()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "imcp".to_string())
+}
+
+/// Parsed command-line options.
+struct Cli {
+    /// Start a Cloudflare quick tunnel and derive `PUBLIC_URL` from it.
+    tunnel: bool,
+}
+
+fn print_help() {
+    let prog = prog_name();
+    println!(
+        "\
+{prog} — MCP server bridging an LLM to the Internet Computer.
+
+USAGE:
+    {prog} [OPTIONS]
+
+OPTIONS:
+    --tunnel         Start a Cloudflare quick tunnel (requires `cloudflared` on
+                     PATH) and use its public https URL as PUBLIC_URL, so clients
+                     can reach the server without any manual setup. Ignored if
+                     PUBLIC_URL is already set.
+    -h, --help       Print this help and exit.
+    -V, --version    Print version and exit.
+
+ENVIRONMENT:
+    PORT                 Port to listen on (default 8000).
+    PUBLIC_URL           Public https URL clients use to reach this server. Set it
+                         yourself, or pass --tunnel to derive it from cloudflared.
+    OAUTH_CLIENTS_FILE   Where OAuth client registrations persist (default
+                         ./oauth-clients.json).
+    RUST_LOG             Log filter (default info)."
+    );
+}
+
+/// Parse argv. Exits the process on `--help`/`--version` or an unknown flag.
+fn parse_cli() -> Cli {
+    let mut tunnel = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--tunnel" => tunnel = true,
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("{} {}", prog_name(), env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("error: unrecognized argument '{other}'\n");
+                print_help();
+                std::process::exit(2);
+            }
+        }
+    }
+    Cli { tunnel }
 }
 
 /// Hosts allowed in the `Host` header by rmcp's DNS-rebinding protection.
@@ -859,6 +933,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = parse_cli();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -866,6 +942,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
+
+    // Optional self-managed Cloudflare tunnel: spawn cloudflared, scrape its
+    // public URL, and set PUBLIC_URL from it BEFORE anything reads PUBLIC_URL
+    // (allowed_hosts() below and auth::base_url() at request time). Held to the
+    // end of main so kill_on_drop tears the tunnel down when the server stops.
+    let _tunnel = if cli.tunnel {
+        if std::env::var_os("PUBLIC_URL").is_some() {
+            tracing::warn!("--tunnel ignored: PUBLIC_URL is already set");
+            None
+        } else {
+            let (url, child) = tunnel::start(&port()).await?;
+            // SAFETY: still single-threaded startup — no other thread reads the
+            // environment yet (request handlers don't exist until axum::serve).
+            std::env::set_var("PUBLIC_URL", &url);
+            tracing::info!("PUBLIC_URL set from tunnel: {url}  (MCP client URL: {url}/mcp)");
+            Some(child)
+        }
+    } else {
+        None
+    };
 
     let agent = Agent::builder().with_url(IC_URL).build()?;
     tracing::info!("built ic-agent against {IC_URL}");

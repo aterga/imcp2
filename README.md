@@ -97,11 +97,46 @@ with remote HTTP + OAuth support works.)
 
 ## Run
 
+### Download a prebuilt binary (no toolchain, no compile)
+
+Each release ships a **single self-contained binary** per platform — all assets
+are baked in, so there's nothing else to install. Grab the one for your OS/arch
+and run it (`--tunnel` is explained below):
+
+```bash
+curl -fsSL https://github.com/aterga/imcp2/releases/latest/download/imcp-$(uname -s)-$(uname -m).tar.gz | tar xz
+./imcp --tunnel
+# prints the public https URL; MCP endpoint is <url>/mcp
+```
+
+Assets are named `imcp-<uname -s>-<uname -m>.tar.gz` (e.g. `imcp-Darwin-arm64`,
+`imcp-Linux-x86_64`). Linux binaries target glibc 2.35+ (Ubuntu 22.04+, Debian
+12+); on older distros use the `Dockerfile` instead. Releases are produced by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) on each `v*` tag.
+
+### Build from source
+
 ```bash
 cargo run
 # serves http://0.0.0.0:8000  (MCP streamable-HTTP at /mcp, info page at /)
 # honours $PORT (default 8000) and $PUBLIC_URL (default http://localhost:8000)
 ```
+
+### One-command public URL with `--tunnel`
+
+Pass `--tunnel` and the server spawns [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+itself, reads back the `https://<name>.trycloudflare.com` URL it prints, and uses
+that as `PUBLIC_URL` automatically — no copy-paste, no restart:
+
+```bash
+cargo run -- --tunnel        # (or: ./imcp --tunnel)
+# => PUBLIC_URL set from tunnel: https://<name>.trycloudflare.com  (MCP client URL: …/mcp)
+```
+
+Requires `cloudflared` on `PATH` (`brew install cloudflared`, or see Cloudflare's
+[downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)).
+If `PUBLIC_URL` is already set, `--tunnel` is ignored. Run `./imcp --help` for all
+options.
 
 ## Deploy
 
@@ -113,7 +148,14 @@ The server is a single binary plus the `static/` assets. Two requirements when h
   (II's `mcp_server_origin` must be configured to this exact origin.)
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
-zero-signup public URL during testing, expose the local server with a tunnel:
+zero-signup public URL during testing, the simplest path is the built-in
+`--tunnel` flag (above), which manages `cloudflared` and `PUBLIC_URL` for you:
+
+```bash
+cargo run -- --tunnel        # (or: ./imcp --tunnel)
+```
+
+Equivalently, run the tunnel yourself and pass the URL in by hand:
 
 ```bash
 cargo run &                                   # local server on :8000
