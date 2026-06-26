@@ -109,8 +109,9 @@ curl -fsSL https://github.com/aterga/imcp2/releases/latest/download/imcp-$(uname
 # prints the public https URL; MCP endpoint is <url>/mcp
 ```
 
-Assets are named `imcp-<uname -s>-<uname -m>.tar.gz` (e.g. `imcp-Darwin-arm64`,
-`imcp-Linux-x86_64`). Linux binaries target glibc 2.35+ (Ubuntu 22.04+, Debian
+Assets are named `imcp-<uname -s>-<uname -m>.tar.gz` (e.g.
+`imcp-Darwin-arm64.tar.gz`, `imcp-Linux-x86_64.tar.gz`). Linux binaries target
+glibc 2.35+ (Ubuntu 22.04+, Debian
 12+); on older distros use the `Dockerfile` instead. Releases are produced by
 [`.github/workflows/release.yml`](.github/workflows/release.yml) on each `v*` tag.
 
