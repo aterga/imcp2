@@ -97,7 +97,7 @@ ENVIRONMENT:
     PUBLIC_URL           Public https URL clients use to reach this server. Set it
                          yourself, or pass --tunnel to derive it from cloudflared.
     OAUTH_CLIENTS_FILE   Where OAuth client registrations persist (default
-                         ./oauth-clients.json).
+                         oauth-clients.json in the working directory).
     RUST_LOG             Log filter (default info)."
     );
 }
