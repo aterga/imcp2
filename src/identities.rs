@@ -312,10 +312,17 @@ impl Identities {
             .build()
             .map_err(|e| format!("could not build II agent: {e}"))?;
 
-        // mcp_prepare_account_delegation(target_origin, session_key, opt max_ttl_ns)
-        //   -> variant { Ok: record { user_key: blob; expiration: nat64 }; Err: AccountDelegationError }
+        // mcp_prepare_account_delegation(target_origin, opt account_number, session_key, opt max_ttl)
+        //   -> variant { Ok: McpPrepareDelegation; Err: AccountDelegationError }
+        // `account_number = null` selects the anchor's default account at
+        // `target_origin`. That default is mutable, so II resolves it to a
+        // concrete account at prepare time and returns it in the reply; we thread
+        // that resolved account into `mcp_get_account_delegation` below so `get`
+        // reads the same account `prepare` signed for.
+        let account_number: Option<u64> = None;
         let prepare_arg = Encode!(
             &origin,
+            &account_number,
             &session_key_der,
             &Some(APP_DELEGATION_TTL_NS)
         )
@@ -330,10 +337,17 @@ impl Identities {
             .map_err(|e| format!("could not decode prepare reply: {e}"))?
             .map_err(|e| format!("II refused mcp_prepare_account_delegation: {e:?}"))?;
 
-        // mcp_get_account_delegation(target_origin, session_key, expiration)
+        // mcp_get_account_delegation(target_origin, opt account_number, session_key, expiration)
         //   -> variant { Ok: SignedDelegation; Err: AccountDelegationError }
-        let get_arg = Encode!(&origin, &session_key_der, &prepared.expiration)
-            .map_err(|e| format!("could not encode get args: {e}"))?;
+        // Thread the account `prepare` resolved to, so `get` reads the same one
+        // (the default account at `target_origin` is mutable between the calls).
+        let get_arg = Encode!(
+            &origin,
+            &prepared.account_number,
+            &session_key_der,
+            &prepared.expiration
+        )
+        .map_err(|e| format!("could not encode get args: {e}"))?;
         let got = agent
             .query(&canister, "mcp_get_account_delegation")
             .with_arg(get_arg)
@@ -441,10 +455,15 @@ fn parse_chain_json(json: &str) -> Result<ParsedChain, String> {
 
 // ---- II candid contract for the mcp_*_account_delegation methods ----
 
-/// `Ok` payload of `mcp_prepare_account_delegation` (II `PrepareAccountDelegation`).
+/// `Ok` payload of `mcp_prepare_account_delegation` (II `McpPrepareDelegation`).
 #[derive(CandidType, Deserialize)]
 struct PreparedDelegation {
     user_key: Vec<u8>,
+    /// The account II resolved the request to (`opt AccountNumber`, `null` =
+    /// the default account at `target_origin`). The default is mutable, so it's
+    /// resolved here and threaded back into `mcp_get_account_delegation` so both
+    /// calls sign for the same account.
+    account_number: Option<u64>,
     expiration: u64,
 }
 
