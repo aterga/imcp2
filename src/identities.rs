@@ -37,8 +37,11 @@ use tokio::sync::RwLock;
 /// Public IC API boundary node the II canister calls are made against.
 const IC_URL: &str = "https://icp-api.io";
 
-/// Requested lifetime of an on-demand app delegation: 5 minutes (the contract's
-/// `max_ttl_ns`). The cache TTL is set slightly under the returned expiration.
+/// Requested lifetime of an on-demand app delegation: 5 minutes, in
+/// **nanoseconds** — the unit of the contract's `max_ttl` arg (II caps it at its
+/// own 5-minute `MCP_MAX_EXPIRATION_PERIOD_NS`). Not to be confused with the
+/// browser `/mcp` flow's `ttl`, which is in minutes. The cache TTL is set
+/// slightly under the returned expiration.
 const APP_DELEGATION_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
 
 /// Re-derive once the cached delegation is within this margin of expiry, so a
@@ -314,6 +317,7 @@ impl Identities {
 
         // mcp_prepare_account_delegation(target_origin, opt account_number, session_key, opt max_ttl)
         //   -> variant { Ok: McpPrepareDelegation; Err: AccountDelegationError }
+        // `max_ttl` is in nanoseconds (we pass APP_DELEGATION_TTL_NS = 5 min).
         // `account_number = null` selects the anchor's default account at
         // `target_origin`. That default is mutable, so II resolves it to a
         // concrete account at prepare time and returns it in the reply; we thread

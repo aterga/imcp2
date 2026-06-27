@@ -232,6 +232,9 @@ mcp_get_account_delegation :
   as; `null` selects the (mutable) default account there. `prepare` resolves it
   and returns the concrete account in its reply, which is threaded back into
   `get` so both calls sign for the same account. The server passes `null`.
+- `max_ttl` is in **nanoseconds**; the server passes 5 minutes
+  (`APP_DELEGATION_TTL_NS`), which is also II's hard cap. (Distinct from the
+  browser `/mcp` flow's `ttl`, which is in minutes.)
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
