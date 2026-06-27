@@ -249,7 +249,14 @@ mcp_get_account_delegation :
 > and reshaped (account-bound delegations) in
 > [dfinity/internet-identity#4052](https://github.com/dfinity/internet-identity/pull/4052);
 > the on-demand path works once that II build is deployed to the configured
-> `II_URL` (the server is built against the same candid contract).
+> `II_URL` (the server is built against the same candid contract). This is
+> compatible both before and after
+> [dfinity/internet-identity#4066](https://github.com/dfinity/internet-identity/pull/4066):
+> #4066 leaves these two methods' signatures unchanged (it only drops the
+> connect-time account picker and the `account_number` arg on
+> `mcp_set_access`/`mcp_access_enabled`, which this server never calls), and
+> passing `account_number = null` keeps resolving to the anchor's default
+> account, so the same build works against either II version.
 
 ## Roadmap
 

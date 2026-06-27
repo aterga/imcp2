@@ -323,6 +323,15 @@ impl Identities {
         // concrete account at prepare time and returns it in the reply; we thread
         // that resolved account into `mcp_get_account_delegation` below so `get`
         // reads the same account `prepare` signed for.
+        //
+        // Threading the *returned* account (rather than hardcoding one) is what
+        // keeps this working across II versions: the two methods' signatures are
+        // identical in dfinity/internet-identity#4052 and #4066, and `null`
+        // resolves to the anchor's default account in both (synthetic fallback in
+        // #4052, `default_account_number()` in #4066 — both authorized, neither
+        // errors). #4066 only drops the connect-time account picker and the
+        // `account_number` arg on `mcp_set_access`/`mcp_access_enabled`, none of
+        // which this server calls. Keep passing `null` and threading the reply.
         let account_number: Option<u64> = None;
         let prepare_arg = Encode!(
             &origin,
