@@ -110,7 +110,9 @@ The server is a single binary plus the `static/` assets. Two requirements when h
 - **HTTPS** — the id.ai passkey (WebAuthn) only works in a secure context.
 - **`PUBLIC_URL`** — set it to the public https URL; it's used in the OAuth
   discovery documents, the sign-in redirect/callback, and the allowed-Host list.
-  (II's `mcp_server_origin` must be configured to this exact origin.)
+  (II derives the MCP server origin from the connect callback, and each user
+  must add this exact origin as their trusted MCP server in II Settings — there
+  is no longer a deploy-time `mcp_server_origin` on II's side.)
 
 A `Dockerfile` is included (works on Render / Fly / Cloud Run / Koyeb). For a
 zero-signup public URL during testing, expose the local server with a tunnel:
@@ -215,15 +217,24 @@ The on-demand derivation calls two **new II canister methods**:
 
 ```candid
 mcp_prepare_account_delegation :
-  (target_origin: text, session_key: blob, max_ttl_ns: opt nat64)
-    -> (record { user_key: blob; expiration: nat64 });
+  (target_origin: text, account_number: opt nat64, session_key: blob, max_ttl: opt nat64)
+    -> (variant {
+         Ok: record { user_key: blob; account_number: opt nat64; expiration: nat64 };
+         Err: AccountDelegationError });
 mcp_get_account_delegation :
-  (target_origin: text, session_key: blob, expiration: nat64)
-    -> (variant { Ok: SignedDelegation; Err: text });
+  (target_origin: text, account_number: opt nat64, session_key: blob, expiration: nat64)
+    -> (variant { Ok: SignedDelegation; Err: AccountDelegationError }) query;
 ```
 
 - `target_origin` is `https://<domain>`, with IC gateway domains remapped:
   `*.icp0.io` / `*.icp.net` → `*.ic0.app`.
+- `account_number` names which of the anchor's accounts at `target_origin` to act
+  as; `null` selects the (mutable) default account there. `prepare` resolves it
+  and returns the concrete account in its reply, which is threaded back into
+  `get` so both calls sign for the same account. The server passes `null`.
+- `max_ttl` is in **nanoseconds**; the server passes 5 minutes
+  (`APP_DELEGATION_TTL_NS`), which is also II's hard cap. (Distinct from the
+  browser `/mcp` flow's `ttl`, which is in minutes.)
 - These methods live on the **same II instance** as the connect-time login:
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
@@ -233,10 +244,19 @@ mcp_get_account_delegation :
 
 > **Status:** the standing-credential connect flow runs against II's existing
 > `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
-> for on-demand app delegations land in
-> [dfinity/internet-identity#4034](https://github.com/dfinity/internet-identity/pull/4034);
+> for on-demand app delegations were introduced in
+> [dfinity/internet-identity#4034](https://github.com/dfinity/internet-identity/pull/4034)
+> and reshaped (account-bound delegations) in
+> [dfinity/internet-identity#4052](https://github.com/dfinity/internet-identity/pull/4052);
 > the on-demand path works once that II build is deployed to the configured
-> `II_URL` (the server is built against the same candid contract).
+> `II_URL` (the server is built against the same candid contract). This is
+> compatible both before and after
+> [dfinity/internet-identity#4066](https://github.com/dfinity/internet-identity/pull/4066):
+> #4066 leaves these two methods' signatures unchanged (it only drops the
+> connect-time account picker and the `account_number` arg on
+> `mcp_set_access`/`mcp_access_enabled`, which this server never calls), and
+> passing `account_number = null` keeps resolving to the anchor's default
+> account, so the same build works against either II version.
 
 ## Roadmap
 

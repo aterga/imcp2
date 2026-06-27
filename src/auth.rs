@@ -225,9 +225,9 @@ pub async fn authorize(State(store): State<AuthStore>, Query(q): Query<Authorize
     );
 
     // II `/mcp` flow: backend public key out, delegation in. No `app` param —
-    // the connection is to the MCP server itself, whose origin II already knows
-    // from its own `mcp_server_origin` config (used both for the delegation's
-    // derivation origin and the caller-principal check). `ttl` is 60 minutes.
+    // the connection is to the MCP server itself, whose origin II derives from
+    // this `callback` URL (used both for the delegation's derivation origin and
+    // the per-user trust check against the identity's config). `ttl` is 60 min.
     let base = base_url();
     let callback = format!("{base}/oauth/connect/callback");
     // II's `/mcp` reads `ttl` as MINUTES (it converts to ns canister-side), so
