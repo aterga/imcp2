@@ -130,13 +130,16 @@ impl AppDelegation {
     }
 }
 
-/// One identity ("account") this connection can act as, surfaced by
-/// [`Identities::list_accounts`]: either the standing Internet Identity principal
-/// (`domain == None`) or a per-app account derived for a `domain`.
+/// One account this connection can act as, surfaced by
+/// [`Identities::list_accounts`]. Every Internet Identity account is scoped to a
+/// single app origin and has its own distinct principal there — the user has no
+/// global, cross-app principal. `domain == None` is the account at the MCP
+/// server's own origin (the standing credential the canister-management tools
+/// sign with); `domain == Some(_)` is the account at that app's origin.
 pub struct AccountInfo {
-    /// The application domain this account is for, or `None` for the standing
-    /// Internet Identity principal (the stable per-connection identity at the
-    /// MCP server's own origin, used by the canister-management tools).
+    /// The app origin this account belongs to, or `None` for the account at the
+    /// MCP server's own origin (the standing credential). Each origin yields its
+    /// own distinct principal.
     pub domain: Option<String>,
     /// The principal you act as for this account — `self_authenticating(user_key)`.
     pub principal: Principal,
@@ -248,10 +251,11 @@ impl Identities {
             .map_err(|e| format!("invalid standing delegation chain: {e}"))
     }
 
-    /// Snapshot the accounts this connection can act as: the standing Internet
-    /// Identity principal first, then every per-app account delegation derived
-    /// (and cached) so far this session, sorted by domain. The principals are
-    /// derived directly from each delegation's `user_key`
+    /// Snapshot the accounts this connection can act as: the account at the MCP
+    /// server's own origin (the standing credential) first, then each per-app
+    /// account derived (and cached) so far this session, sorted by domain — every
+    /// account being a distinct per-origin principal, never a global one. The
+    /// principals are derived directly from each delegation's `user_key`
     /// (`self_authenticating(user_key)`), so this never touches the network and
     /// reports cached/expiring delegations as-is (re-derivation happens lazily on
     /// the next `delegated_identity`). Requires the standing credential.

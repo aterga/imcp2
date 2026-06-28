@@ -17,7 +17,7 @@ encoding/decoding and signing against the IC via
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
 | `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
 | `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
-| `list_accounts` | — | The accounts this connection holds: your standing Internet Identity principal plus every per-app account derived so far this session, each with its principal and time-to-expiry |
+| `list_accounts` | — | The accounts this connection holds: your account at the MCP server's own origin (the standing credential) plus every per-app account derived so far this session — each a distinct per-origin principal with its time-to-expiry |
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
@@ -49,9 +49,10 @@ call as your account at that app. For a domain, the server mints a **short-lived
 Identity credential (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
 without a call, and `list_accounts` enumerates the accounts the connection already
-holds — the standing principal plus each per-app account derived this session (a
-fresh session lists only the standing principal until a `domain` is used). All
-these tools require a bearer token (see Auth).
+holds — your account at the MCP server's own origin (the standing credential) plus
+each per-app account derived this session, every one a distinct per-origin
+principal (a fresh session lists only that first account until a `domain` is used).
+All these tools require a bearer token (see Auth).
 
 ### Skills awareness
 

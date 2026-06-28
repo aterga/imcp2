@@ -266,7 +266,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "List the Internet Computer accounts this connection can act as: your standing Internet Identity principal (the stable per-connection identity at this MCP server's own origin, used by the canister-management tools), plus every per-application account derived so far this session — one per `domain` used with call_canister/get_principal — each with its principal and time-to-expiry. Per-app accounts are derived on demand, so a fresh session lists only the standing principal until you use a domain. Requires an authenticated session."
+        description = "List the Internet Computer accounts this connection can act as. Internet Identity gives the user a distinct principal per app origin (never a global, cross-app one), so each entry is a per-origin account: first your account at this MCP server's own origin (from the connection's standing Internet Identity credential — the identity the canister-management tools sign with), then every per-application account derived so far this session (one per `domain` used with call_canister/get_principal), each with its principal and time-to-expiry. Per-app accounts are derived on demand, so a fresh session lists only that first account until you use a domain. Requires an authenticated session."
     )]
     async fn list_accounts(
         &self,
@@ -733,8 +733,9 @@ impl ServerHandler for IcTools {
              Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
              you act as at an application `domain` without making a call (e.g. to look up a \
              balance or account); `list_accounts` enumerates the accounts this connection already \
-             holds — your standing principal plus every per-app account derived so far this \
-             session. The standing credential is obtained when you connect \
+             holds — your account at this server's own origin (the standing credential) plus every \
+             per-app account derived so far this session, each a distinct per-origin principal. \
+             The standing credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
              `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
@@ -876,8 +877,8 @@ fn format_accounts(accounts: &[identities::AccountInfo]) -> String {
     for a in accounts {
         match &a.domain {
             None => out.push_str(&format!(
-                "- {} — your standing Internet Identity principal (this MCP server's origin; \
-                 used by the canister-management tools) [{}]\n",
+                "- {} — your account at this MCP server's own origin (the standing \
+                 credential; used by the canister-management tools) [{}]\n",
                 a.principal,
                 ttl(a.expiration_ns)
             )),
