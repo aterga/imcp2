@@ -266,6 +266,24 @@ impl IcTools {
     }
 
     #[tool(
+        description = "List the Internet Computer accounts this connection can act as: your standing Internet Identity principal (the stable per-connection identity at this MCP server's own origin, used by the canister-management tools), plus every per-application account derived so far this session — one per `domain` used with call_canister/get_principal — each with its principal and time-to-expiry. Per-app accounts are derived on demand, so a fresh session lists only the standing principal until you use a domain. Requires an authenticated session."
+    )]
+    async fn list_accounts(
+        &self,
+        Parameters(_args): Parameters<management::NoArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_id = match authed_session(&ctx) {
+            Some(s) => s.session_id,
+            None => return Ok(err("listing your accounts needs an authenticated session".into())),
+        };
+        match self.identities.list_accounts(&session_id).await {
+            Ok(accounts) => Ok(ok(format_accounts(&accounts))),
+            Err(e) => Ok(err(e)),
+        }
+    }
+
+    #[tool(
         description = "Discover the Internet Computer canisters behind a web domain (e.g. \"oisy.com\"). Returns every canister id found, with provenance: the `x-ic-canister-id` header (the frontend/asset canister — authoritative), a `/env.json` runtime config (e.g. backend_canister_id), and labelled/bare canister-id literals mined from the JS bundle. There is no authoritative reverse lookup for a site's backend, so results from env.json/bundle are candidates: pick by label (prefer production/IC ids) and confirm with get_candid before calling."
     )]
     async fn discover_canisters(
@@ -714,7 +732,9 @@ impl ServerHandler for IcTools {
              account delegation for it is minted ON DEMAND from this connection's standing \
              Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
              you act as at an application `domain` without making a call (e.g. to look up a \
-             balance or account). The standing credential is obtained when you connect \
+             balance or account); `list_accounts` enumerates the accounts this connection already \
+             holds — your standing principal plus every per-app account derived so far this \
+             session. The standing credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
              `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
@@ -831,6 +851,58 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
     s
 }
 
+/// Render the accounts a connection holds (from `Identities::list_accounts`) as
+/// readable text for the `list_accounts` tool: the standing II principal first,
+/// then each per-app account, with a human time-to-expiry.
+fn format_accounts(accounts: &[identities::AccountInfo]) -> String {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let ttl = |exp: u64| -> String {
+        if exp <= now_ns {
+            "expired".to_string()
+        } else {
+            let secs = (exp - now_ns) / 1_000_000_000;
+            if secs >= 60 {
+                format!("expires in ~{} min", secs / 60)
+            } else {
+                format!("expires in ~{secs}s")
+            }
+        }
+    };
+
+    let mut out = String::from("Accounts this connection can act as:\n");
+    for a in accounts {
+        match &a.domain {
+            None => out.push_str(&format!(
+                "- {} — your standing Internet Identity principal (this MCP server's origin; \
+                 used by the canister-management tools) [{}]\n",
+                a.principal,
+                ttl(a.expiration_ns)
+            )),
+            Some(domain) => out.push_str(&format!(
+                "- {} — your account at {domain} [{}]\n",
+                a.principal,
+                ttl(a.expiration_ns)
+            )),
+        }
+    }
+    if accounts.len() <= 1 {
+        out.push_str(
+            "\nNo per-app accounts derived yet this session. Use call_canister or get_principal \
+             with a `domain` (e.g. \"oisy.com\") to derive your account at that app on demand.",
+        );
+    } else {
+        out.push_str(
+            "\nPer-app accounts are short-lived (re-derived on demand near expiry); the standing \
+             credential lasts ~60 min. Use get_principal(domain) for one principal, or \
+             call_canister(domain=…) to act as it.",
+        );
+    }
+    out
+}
+
 fn ok(text: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
@@ -852,7 +924,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (the accounts this connection holds — standing principal + per-app accounts derived this session). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;

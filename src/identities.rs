@@ -130,6 +130,20 @@ impl AppDelegation {
     }
 }
 
+/// One identity ("account") this connection can act as, surfaced by
+/// [`Identities::list_accounts`]: either the standing Internet Identity principal
+/// (`domain == None`) or a per-app account derived for a `domain`.
+pub struct AccountInfo {
+    /// The application domain this account is for, or `None` for the standing
+    /// Internet Identity principal (the stable per-connection identity at the
+    /// MCP server's own origin, used by the canister-management tools).
+    pub domain: Option<String>,
+    /// The principal you act as for this account — `self_authenticating(user_key)`.
+    pub principal: Principal,
+    /// Delegation expiry, nanoseconds since the Unix epoch.
+    pub expiration_ns: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct Identities {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
@@ -232,6 +246,37 @@ impl Identities {
         let key = BasicIdentity::from_raw_key(&s.key_seed);
         DelegatedIdentity::new(standing.user_key.clone(), Box::new(key), standing.chain.clone())
             .map_err(|e| format!("invalid standing delegation chain: {e}"))
+    }
+
+    /// Snapshot the accounts this connection can act as: the standing Internet
+    /// Identity principal first, then every per-app account delegation derived
+    /// (and cached) so far this session, sorted by domain. The principals are
+    /// derived directly from each delegation's `user_key`
+    /// (`self_authenticating(user_key)`), so this never touches the network and
+    /// reports cached/expiring delegations as-is (re-derivation happens lazily on
+    /// the next `delegated_identity`). Requires the standing credential.
+    pub async fn list_accounts(&self, session_id: &str) -> Result<Vec<AccountInfo>, String> {
+        let sessions = self.sessions.read().await;
+        let s = sessions.get(session_id).ok_or("no such session")?;
+        let standing = s.standing.as_ref().ok_or(
+            "no standing Internet Identity credential for this connection — reconnect and sign \
+             in with Internet Identity",
+        )?;
+        let mut accounts = vec![AccountInfo {
+            domain: None,
+            principal: Principal::self_authenticating(&standing.user_key),
+            expiration_ns: standing.expiration_ns,
+        }];
+        let mut apps: Vec<(&String, &AppDelegation)> = s.app_delegations.iter().collect();
+        apps.sort_by(|a, b| a.0.cmp(b.0));
+        for (domain, app) in apps {
+            accounts.push(AccountInfo {
+                domain: Some(domain.clone()),
+                principal: Principal::self_authenticating(&app.user_key),
+                expiration_ns: app.expiration_ns,
+            });
+        }
+        Ok(accounts)
     }
 
     /// Build the `ic-agent` identity for a domain, deriving the per-app account
@@ -532,7 +577,7 @@ impl IiSignedDelegation {
 
 #[cfg(test)]
 mod tests {
-    use super::target_origin;
+    use super::*;
 
     #[test]
     fn remaps_gateway_domains_to_ic0_app() {
@@ -551,5 +596,73 @@ mod tests {
         assert_eq!(target_origin("oisy.com"), "https://oisy.com");
         assert_eq!(target_origin("https://oisy.com/app"), "https://oisy.com");
         assert_eq!(target_origin("http://oisy.com"), "https://oisy.com");
+    }
+
+    // Seed a session with a standing credential and the given per-app
+    // delegations directly, bypassing the network derivation flow.
+    async fn seed(ids: &Identities, session_id: &str, standing_key: &[u8], apps: &[(&str, &[u8], u64)]) {
+        ids.ensure_session(session_id).await;
+        let mut sessions = ids.sessions.write().await;
+        let s = sessions.get_mut(session_id).expect("ensured session");
+        s.standing = Some(Standing {
+            user_key: standing_key.to_vec(),
+            chain: vec![],
+            expiration_ns: 1_000,
+        });
+        for (domain, key, exp) in apps {
+            s.app_delegations.insert(
+                (*domain).to_string(),
+                AppDelegation {
+                    user_key: key.to_vec(),
+                    chain: vec![],
+                    expiration_ns: *exp,
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_accounts_reports_standing_first_then_apps_sorted() {
+        let ids = Identities::new();
+        seed(
+            &ids,
+            "sess",
+            &[1, 2, 3],
+            &[("oisy.com", &[4, 5, 6], 2_000), ("nns.ic0.app", &[7, 8, 9], 3_000)],
+        )
+        .await;
+
+        let accounts = ids.list_accounts("sess").await.expect("accounts");
+        assert_eq!(accounts.len(), 3);
+
+        // Standing principal first, with no domain.
+        assert_eq!(accounts[0].domain, None);
+        assert_eq!(accounts[0].principal, Principal::self_authenticating([1, 2, 3]));
+        assert_eq!(accounts[0].expiration_ns, 1_000);
+
+        // Apps follow, sorted by domain name.
+        assert_eq!(accounts[1].domain.as_deref(), Some("nns.ic0.app"));
+        assert_eq!(accounts[1].principal, Principal::self_authenticating([7, 8, 9]));
+        assert_eq!(accounts[2].domain.as_deref(), Some("oisy.com"));
+        assert_eq!(accounts[2].principal, Principal::self_authenticating([4, 5, 6]));
+    }
+
+    #[tokio::test]
+    async fn list_accounts_with_no_apps_returns_only_standing() {
+        let ids = Identities::new();
+        seed(&ids, "sess", &[1, 2, 3], &[]).await;
+        let accounts = ids.list_accounts("sess").await.expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].domain, None);
+    }
+
+    #[tokio::test]
+    async fn list_accounts_requires_a_standing_credential() {
+        let ids = Identities::new();
+        ids.ensure_session("sess").await;
+        // Authenticated session but no standing credential captured yet.
+        assert!(ids.list_accounts("sess").await.is_err());
+        // Unknown session is likewise an error.
+        assert!(ids.list_accounts("nope").await.is_err());
     }
 }
