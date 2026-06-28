@@ -239,7 +239,7 @@ mcp_get_account_delegation :
   and returns the concrete account in its reply, which is threaded back into
   `get` so both calls sign for the same account. The server passes `null` for the
   default account, or a specific number when an `account` name was given — resolved
-  from `get_accounts` (see [Listing accounts](#listing-accounts) below).
+  from `mcp_get_accounts` (see [Listing accounts](#listing-accounts) below).
 - `max_ttl` is in **nanoseconds**; the server passes 5 minutes
   (`APP_DELEGATION_TTL_NS`), which is also II's hard cap. (Distinct from the
   browser `/mcp` flow's `ttl`, which is in minutes.)
@@ -258,20 +258,19 @@ account is a **distinct per-origin principal** — the app never sees a global,
 cross-app identity. `list_accounts(domain)` returns them by calling II's
 
 ```candid
-get_accounts : (anchor_number: nat64, origin: text)
-  -> (variant { Ok: vec AccountInfo; Err: GetAccountsError }) query;
+mcp_get_accounts : (target_origin: text)
+  -> (variant { Ok: vec AccountInfo; Err: AccountDelegationError }) query;
 type AccountInfo = record {
   account_number: opt nat64; origin: text; last_used: opt nat64; name: opt text;
 };
 ```
 
-signed as the standing identity. The **anchor number** is captured from the
-`/mcp` connect flow (stored with the standing credential); if a session has none,
-account listing reports a clear error and the user reconnects. To act as a
-non-default account, pass its `name` to `call_canister`/`get_principal` as
-`account`; the server resolves the name to its `account_number` via `get_accounts`
-and threads that into the on-demand delegation. Omitting `account` uses the
-default account, as before.
+signed as the standing identity. Like the `mcp_*_account_delegation` methods, II
+**recovers the anchor from the caller** (the connect-time MCP-origin principal),
+so no anchor number is needed. To act as a non-default account, pass its `name` to
+`call_canister`/`get_principal` as `account`; the server resolves the name to its
+`account_number` via `mcp_get_accounts` and threads that into the on-demand
+delegation. Omitting `account` uses the default account, as before.
 
 > **Status:** the standing-credential connect flow runs against II's existing
 > `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
@@ -289,12 +288,10 @@ default account, as before.
 > passing `account_number = null` keeps resolving to the anchor's default
 > account, so the same build works against either II version.
 >
-> **Account listing/selection** (`list_accounts`, the `account` arg) is built
-> against II's `get_accounts(anchor_number, origin)` query and depends on two
-> II-side pieces: the `/mcp` connect flow returning the **anchor number** (captured
-> in `connect_callback`; the field spelling is accepted leniently and may need
-> updating to match the deployed flow), and `get_accounts` authorizing the
-> standing/MCP-derived caller. Until both are live, listing reports a clear error.
+> **Account listing/selection** (`list_accounts`, the `account` arg) calls II's
+> `mcp_get_accounts(target_origin)` query, which — like the
+> `mcp_*_account_delegation` methods — recovers the anchor from the caller, so it
+> needs no anchor number and works as soon as the same II build is live.
 
 ## Roadmap
 
@@ -306,10 +303,10 @@ default account, as before.
       connection mints ≤5-min per-app account delegations directly via II canister
       methods (`call_canister`/`get_principal` `domain`); no per-app browser flow.
 - [x] **Per-app accounts**: `list_accounts(domain)` lists the user's accounts at
-      an app (via `get_accounts`), and `call_canister`/`get_principal` take an
+      an app (via `mcp_get_accounts`), and `call_canister`/`get_principal` take an
       `account` name to act as a specific (non-default) account.
-- [ ] Deploy the `mcp_*_account_delegation` canister methods + the `get_accounts`
-      path (server is built against their candid contract; the live round-trip,
-      including the anchor number from the `/mcp` flow, lands with the II side).
+- [ ] Deploy the `mcp_*_account_delegation` + `mcp_get_accounts` canister methods
+      (server is built against their candid contract; the live round-trip lands
+      with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.
