@@ -15,9 +15,9 @@ encoding/decoding and signing against the IC via
 | `find_canister` | `query` | Canister ids matching a name/symbol, searched in the IC dashboard's service registries — ICRC token ledgers (e.g. `ckUSDC`) and the SNS project catalog |
 | `lookup_canister` | `canister_id` | What a canister IS, per the IC dashboard: label/name, type, controllers, subnet, module hash, latest upgrade proposal |
 | `get_candid` | `canister_id` | The canister's `candid:service` interface (`.did` text) |
-| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand |
-| `get_principal` | `domain` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
-| `list_accounts` | — | The accounts this connection holds: your account at the MCP server's own origin (the standing credential) plus every per-app account derived so far this session — each a distinct per-origin principal with its time-to-expiry |
+| `call_canister` | `canister_id`, `method`, `args` (textual Candid), `is_query`, `domain?`, `account?` | Reply as textual Candid; called anonymously (no `domain`) or as your account at an application domain, derived on demand (`account` names a non-default account there) |
+| `get_principal` | `domain`, `account?` | The principal you act as at an application domain (derives the delegation on demand, same as `call_canister`), without making a call |
+| `list_accounts` | `domain` | The user's Internet Identity accounts at an app — the default ("synthetic") account plus any named ones — with name, account number, and last-used time; name one via `account` in `call_canister`/`get_principal` |
 | `list_ic_skills` | — | The official [IC skills](https://skills.internetcomputer.org) (Motoko, mops/icp CLIs, cycles, stable memory, security, …), grouped by category |
 | `get_ic_skill` | `name` | The full `SKILL.md` instructions for one skill (e.g. `motoko`, `icp-cli`, `cycles-management`) |
 | `cycles_balance` | — | Your cycles-ledger balance (the funds `create_canister`/`top_up_canister` spend), as your standing II principal |
@@ -48,11 +48,12 @@ call as your account at that app. For a domain, the server mints a **short-lived
 (≤5 min) account delegation on demand** from the connection's standing Internet
 Identity credential (see [Domain identities](#domain-identities-on-demand)) —
 there is no per-app sign-in step. `get_principal` returns that account's principal
-without a call, and `list_accounts` enumerates the accounts the connection already
-holds — your account at the MCP server's own origin (the standing credential) plus
-each per-app account derived this session, every one a distinct per-origin
-principal (a fresh session lists only that first account until a `domain` is used).
-All these tools require a bearer token (see Auth).
+without a call. A user may hold several accounts at an app — a default
+("synthetic") account everyone gets automatically, plus any they have named — so
+`list_accounts(domain)` lists them (via II's `get_accounts`), and
+`call_canister`/`get_principal` take an optional `account` (a name from that list)
+to act as a specific one; omit it for the default account. All these tools require
+a bearer token (see Auth).
 
 ### Skills awareness
 
@@ -236,7 +237,9 @@ mcp_get_account_delegation :
 - `account_number` names which of the anchor's accounts at `target_origin` to act
   as; `null` selects the (mutable) default account there. `prepare` resolves it
   and returns the concrete account in its reply, which is threaded back into
-  `get` so both calls sign for the same account. The server passes `null`.
+  `get` so both calls sign for the same account. The server passes `null` for the
+  default account, or a specific number when an `account` name was given — resolved
+  from `get_accounts` (see [Listing accounts](#listing-accounts) below).
 - `max_ttl` is in **nanoseconds**; the server passes 5 minutes
   (`APP_DELEGATION_TTL_NS`), which is also II's hard cap. (Distinct from the
   browser `/mcp` flow's `ttl`, which is in minutes.)
@@ -244,8 +247,31 @@ mcp_get_account_delegation :
   `II_URL` (default `https://beta.id.ai`) is the browser login origin and
   `II_CANISTER_ID` (default `fgte5-ciaaa-aaaad-aaatq-cai`, that instance's
   canister) is the canister these calls target, over `https://icp-api.io`.
-- Derived delegations are cached per `(session, domain)` and reused until they
-  near expiry, then re-derived.
+- Derived delegations are cached per `(session, domain, account_number)` and
+  reused until they near expiry, then re-derived.
+
+### Listing accounts
+
+A user can hold several accounts at one app: a default ("synthetic") account
+everyone gets automatically, plus any **named** accounts they created there. Each
+account is a **distinct per-origin principal** — the app never sees a global,
+cross-app identity. `list_accounts(domain)` returns them by calling II's
+
+```candid
+get_accounts : (anchor_number: nat64, origin: text)
+  -> (variant { Ok: vec AccountInfo; Err: GetAccountsError }) query;
+type AccountInfo = record {
+  account_number: opt nat64; origin: text; last_used: opt nat64; name: opt text;
+};
+```
+
+signed as the standing identity. The **anchor number** is captured from the
+`/mcp` connect flow (stored with the standing credential); if a session has none,
+account listing reports a clear error and the user reconnects. To act as a
+non-default account, pass its `name` to `call_canister`/`get_principal` as
+`account`; the server resolves the name to its `account_number` via `get_accounts`
+and threads that into the on-demand delegation. Omitting `account` uses the
+default account, as before.
 
 > **Status:** the standing-credential connect flow runs against II's existing
 > `/mcp` delegation flow. The two `mcp_*_account_delegation` canister methods used
@@ -262,6 +288,13 @@ mcp_get_account_delegation :
 > `mcp_set_access`/`mcp_access_enabled`, which this server never calls), and
 > passing `account_number = null` keeps resolving to the anchor's default
 > account, so the same build works against either II version.
+>
+> **Account listing/selection** (`list_accounts`, the `account` arg) is built
+> against II's `get_accounts(anchor_number, origin)` query and depends on two
+> II-side pieces: the `/mcp` connect flow returning the **anchor number** (captured
+> in `connect_callback`; the field spelling is accepted leniently and may need
+> updating to match the deployed flow), and `get_accounts` authorizing the
+> standing/MCP-derived caller. Until both are live, listing reports a clear error.
 
 ## Roadmap
 
@@ -272,7 +305,11 @@ mcp_get_account_delegation :
 - [x] On-demand **domain identities**: a 60-min standing II delegation per
       connection mints ≤5-min per-app account delegations directly via II canister
       methods (`call_canister`/`get_principal` `domain`); no per-app browser flow.
-- [ ] Deploy the `mcp_*_account_delegation` canister methods (server is built
-      against their candid contract; the live round-trip lands with the II side).
+- [x] **Per-app accounts**: `list_accounts(domain)` lists the user's accounts at
+      an app (via `get_accounts`), and `call_canister`/`get_principal` take an
+      `account` name to act as a specific (non-default) account.
+- [ ] Deploy the `mcp_*_account_delegation` canister methods + the `get_accounts`
+      path (server is built against their candid contract; the live round-trip,
+      including the anchor number from the `/mcp` flow, lands with the II side).
 - [ ] Persist sessions/delegations (currently in-memory, lost on restart).
 - [ ] Scoped delegations / per-call confirmation for sensitive methods.

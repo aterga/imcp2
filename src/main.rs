@@ -95,6 +95,11 @@ struct CallCanisterArgs {
     /// derived on demand for this connection. Omit to call anonymously.
     #[serde(default)]
     domain: Option<String>,
+    /// Which of your accounts at `domain` to act as, by account name (see
+    /// list_accounts). Omit to use that app's default account. Ignored when
+    /// `domain` is omitted (anonymous calls have no account).
+    #[serde(default)]
+    account: Option<String>,
     /// Optional Candid service definition (`.did` text) for the canister. Used to
     /// encode the args to the method's declared types and decode the reply, for
     /// when the canister's own `candid:service` metadata can't be read (e.g.
@@ -118,6 +123,16 @@ struct GetPrincipalArgs {
     /// The application domain to resolve, e.g. "oisy.com". Returns the principal
     /// you act as at that app — its account delegation is derived on demand (same
     /// as call_canister) and its principal returned.
+    domain: String,
+    /// Which of your accounts at `domain` to resolve, by account name (see
+    /// list_accounts). Omit to use that app's default account.
+    #[serde(default)]
+    account: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ListAccountsArgs {
+    /// The application domain whose accounts to list, e.g. "oisy.com".
     domain: String,
 }
 
@@ -186,7 +201,7 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed."
+        description = "Call a method on an Internet Computer canister with textual Candid in and out. Args are encoded against the method's declared Candid types (so plain literals like 42 coerce correctly — no `: type` annotations needed). Omit `domain` to call anonymously, or pass an application domain (e.g. \"oisy.com\") to call as your account at that app — a short-lived account delegation is derived on demand from this connection's standing Internet Identity credential. By default this uses the app's default account; pass `account` (an account name from list_accounts) to act as a specific named account there. Set is_query=true for read-only query calls. If get_candid couldn't fetch the interface, pass the `.did` text as `candid` (e.g. ask the user for it) so args/replies are still typed."
     )]
     async fn call_canister(
         &self,
@@ -196,6 +211,7 @@ impl IcTools {
             args,
             is_query,
             domain,
+            account,
             candid,
         }): Parameters<CallCanisterArgs>,
         ctx: RequestContext<RoleServer>,
@@ -223,7 +239,11 @@ impl IcTools {
                     Some(s) => s.session_id,
                     None => return Ok(err("calling as a domain needs an authenticated session".into())),
                 };
-                let delegated = match self.identities.delegated_identity(&session_id, &domain).await {
+                let delegated = match self
+                    .identities
+                    .delegated_identity_for(&session_id, &domain, account.as_deref())
+                    .await
+                {
                     Ok(d) => d,
                     Err(e) => return Ok(err(e)),
                 };
@@ -244,18 +264,22 @@ impl IcTools {
     }
 
     #[tool(
-        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method."
+        description = "Get the Internet Computer principal you act as at a given application `domain` (e.g. \"oisy.com\"), without making a canister call. The app's account delegation is derived on demand (same as call_canister) from this connection's standing Internet Identity credential, and its principal is returned. By default this resolves the app's default account; pass `account` (an account name from list_accounts) for a specific named account there. Use this when a flow needs the principal itself (e.g. to look up a balance or account) rather than to invoke a method."
     )]
     async fn get_principal(
         &self,
-        Parameters(GetPrincipalArgs { domain }): Parameters<GetPrincipalArgs>,
+        Parameters(GetPrincipalArgs { domain, account }): Parameters<GetPrincipalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("getting a domain principal needs an authenticated session".into())),
         };
-        let delegated = match self.identities.delegated_identity(&session_id, &domain).await {
+        let delegated = match self
+            .identities
+            .delegated_identity_for(&session_id, &domain, account.as_deref())
+            .await
+        {
             Ok(d) => d,
             Err(e) => return Ok(err(e)),
         };
@@ -266,19 +290,19 @@ impl IcTools {
     }
 
     #[tool(
-        description = "List the Internet Computer accounts this connection can act as. Internet Identity gives the user a distinct principal per app origin (never a global, cross-app one), so each entry is a per-origin account: first your account at this MCP server's own origin (from the connection's standing Internet Identity credential — the identity the canister-management tools sign with), then every per-application account derived so far this session (one per `domain` used with call_canister/get_principal), each with its principal and time-to-expiry. Per-app accounts are derived on demand, so a fresh session lists only that first account until you use a domain. Requires an authenticated session."
+        description = "List the user's Internet Identity accounts at an application `domain` (e.g. \"oisy.com\"). Internet Identity gives the user a distinct principal per app, and within an app they may hold several accounts: a default (\"synthetic\") account everyone gets automatically, plus any named accounts they created. Use this before acting on the user's behalf at an app: if there's only the default account, just proceed (call_canister/get_principal with no `account`); if there are several, pick one with the user (or act on each) by passing its name as `account`. Returns each account's name (the default has none), account number, and last-used time. Requires an authenticated session."
     )]
     async fn list_accounts(
         &self,
-        Parameters(_args): Parameters<management::NoArgs>,
+        Parameters(ListAccountsArgs { domain }): Parameters<ListAccountsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session_id = match authed_session(&ctx) {
             Some(s) => s.session_id,
             None => return Ok(err("listing your accounts needs an authenticated session".into())),
         };
-        match self.identities.list_accounts(&session_id).await {
-            Ok(accounts) => Ok(ok(format_accounts(&accounts))),
+        match self.identities.list_accounts(&session_id, &domain).await {
+            Ok(accounts) => Ok(ok(format_accounts(&domain, &accounts))),
             Err(e) => Ok(err(e)),
         }
     }
@@ -732,10 +756,10 @@ impl ServerHandler for IcTools {
              account delegation for it is minted ON DEMAND from this connection's standing \
              Internet Identity credential, no extra sign-in. `get_principal` returns the principal \
              you act as at an application `domain` without making a call (e.g. to look up a \
-             balance or account); `list_accounts` enumerates the accounts this connection already \
-             holds — your account at this server's own origin (the standing credential) plus every \
-             per-app account derived so far this session, each a distinct per-origin principal. \
-             The standing credential is obtained when you connect \
+             balance or account). A user may hold several accounts at an app (a default one plus \
+             named ones); `list_accounts(domain)` lists them, and call_canister/get_principal take \
+             an optional `account` (a name from that list) to act as a specific one — omit it for \
+             the default account. The standing credential is obtained when you connect \
              (authenticate via Internet Identity) and lasts ~60 minutes; reconnect when it expires.\n\n\
              To AUTHOR, BUILD and DEPLOY IC code, first consult the official IC skills: \
              `list_ic_skills` lists them and `get_ic_skill(name)` loads one. Especially `motoko` \
@@ -852,53 +876,39 @@ fn format_canister_info(info: &discover::CanisterInfo) -> String {
     s
 }
 
-/// Render the accounts a connection holds (from `Identities::list_accounts`) as
-/// readable text for the `list_accounts` tool: the standing II principal first,
-/// then each per-app account, with a human time-to-expiry.
-fn format_accounts(accounts: &[identities::AccountInfo]) -> String {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let ttl = |exp: u64| -> String {
-        if exp <= now_ns {
-            "expired".to_string()
-        } else {
-            let secs = (exp - now_ns) / 1_000_000_000;
-            if secs >= 60 {
-                format!("expires in ~{} min", secs / 60)
-            } else {
-                format!("expires in ~{secs}s")
-            }
-        }
-    };
-
-    let mut out = String::from("Accounts this connection can act as:\n");
-    for a in accounts {
-        match &a.domain {
-            None => out.push_str(&format!(
-                "- {} — your account at this MCP server's own origin (the standing \
-                 credential; used by the canister-management tools) [{}]\n",
-                a.principal,
-                ttl(a.expiration_ns)
-            )),
-            Some(domain) => out.push_str(&format!(
-                "- {} — your account at {domain} [{}]\n",
-                a.principal,
-                ttl(a.expiration_ns)
-            )),
-        }
+/// Render the user's accounts at an app (from `Identities::list_accounts`) as
+/// readable text for the `list_accounts` tool.
+fn format_accounts(domain: &str, accounts: &[identities::AccountInfo]) -> String {
+    if accounts.is_empty() {
+        return format!("No Internet Identity accounts found at {domain}.");
     }
-    if accounts.len() <= 1 {
+    let mut out = format!("Your accounts at {domain}:\n");
+    for a in accounts {
+        // The default ("synthetic") account has no name and no account number.
+        let label = match &a.name {
+            Some(name) => format!("\"{name}\""),
+            None => "(default account — no name)".to_string(),
+        };
+        let number = match a.account_number {
+            Some(n) => format!("account #{n}"),
+            None => "default".to_string(),
+        };
+        let last_used = a
+            .last_used
+            .map(|ns| format!(", last used {ns} ns since epoch"))
+            .unwrap_or_default();
+        out.push_str(&format!("- {label} [{number}{last_used}]\n"));
+    }
+    if accounts.len() == 1 {
         out.push_str(
-            "\nNo per-app accounts derived yet this session. Use call_canister or get_principal \
-             with a `domain` (e.g. \"oisy.com\") to derive your account at that app on demand.",
+            "\nOnly the default account exists here — act on the user's behalf directly: \
+             call_canister(domain) / get_principal(domain) with no `account`.",
         );
     } else {
         out.push_str(
-            "\nPer-app accounts are short-lived (re-derived on demand near expiry); the standing \
-             credential lasts ~60 min. Use get_principal(domain) for one principal, or \
-             call_canister(domain=…) to act as it.",
+            "\nThere are multiple accounts here. Confirm which one the user means (or act on each), \
+             then pass its name as `account` to call_canister / get_principal. Omit `account` for \
+             the default one.",
         );
     }
     out
@@ -925,7 +935,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:40rem;margin:3rem auto">
 <h1>Internet Computer MCP PoC</h1>
 <p>MCP endpoint: <code>POST /mcp</code></p>
-<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (the accounts this connection holds — standing principal + per-app accounts derived this session). All speak textual Candid.</p>
+<p>Tools: <code>discover_canisters</code> (domain → canister ids), <code>find_canister</code> (name → canister ids), <code>lookup_canister</code> (id → dashboard identity), <code>get_candid</code>, <code>call_canister</code> (anonymously, or as your account at an application domain, derived on demand from the connection's standing Internet Identity delegation), <code>get_principal</code> (your principal at an application domain, no call), <code>list_accounts</code> (your Internet Identity accounts at an app domain). All speak textual Candid.</p>
 <p>Skills: <code>list_ic_skills</code> / <code>get_ic_skill</code> (the official IC how-to guides — Motoko, mops, icp CLI, cycles, …).</p>
 <p>Canister management (as your Internet Identity): <code>cycles_balance</code>, <code>create_canister</code>, <code>install_code</code>, <code>canister_status</code>, <code>update_canister_settings</code>, <code>start_canister</code>, <code>stop_canister</code>, <code>uninstall_code</code>, <code>delete_canister</code>, <code>top_up_canister</code>.</p>
 </body></html>"#;
