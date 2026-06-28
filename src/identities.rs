@@ -104,8 +104,10 @@ struct Session {
     /// flow (`anchor -> this session key`, issued for the MCP origin). `None`
     /// until the connect flow completes.
     standing: Option<Standing>,
-    /// domain -> most recently derived per-app delegation.
-    app_delegations: HashMap<String, AppDelegation>,
+    /// `(domain, account_number)` -> most recently derived per-app delegation.
+    /// Keyed by account too, since each account at an origin signs as a distinct
+    /// principal (`account_number == None` is that origin's default account).
+    app_delegations: HashMap<(String, Option<u64>), AppDelegation>,
 }
 
 /// The connect-time standing credential: a chain `anchor -> backend session key`
@@ -114,6 +116,11 @@ struct Standing {
     user_key: Vec<u8>,
     chain: Vec<SignedDelegation>,
     expiration_ns: u64,
+    /// The anchor (user) number behind this credential, as reported by II's
+    /// `/mcp` flow at connect time. Needed to call II's `get_accounts(anchor,
+    /// origin)` when listing the user's accounts at an app. `None` if the flow
+    /// did not provide it (older II) — account listing then errors clearly.
+    anchor_number: Option<u64>,
 }
 
 /// A cached on-demand per-app account delegation.
@@ -128,6 +135,21 @@ impl AppDelegation {
     fn fresh(&self) -> bool {
         self.expiration_ns > now_ns().saturating_add(REDERIVE_MARGIN_NS)
     }
+}
+
+/// One of the user's Internet Identity accounts at an app origin, as returned by
+/// [`Identities::list_accounts`] (II's `get_accounts`). Each account is a
+/// distinct per-origin principal; `account_number == None`/`name == None` is the
+/// origin's default ("synthetic") account, which every user has automatically.
+pub struct AccountInfo {
+    /// II account number — `None` for the origin's default account. Pass the
+    /// account's `name` to the acting tools to use a non-default account; the
+    /// server resolves it back to this number for the delegation.
+    pub account_number: Option<u64>,
+    /// User-given account name — `None` for the default account.
+    pub name: Option<String>,
+    /// When the account was last used (ns since the Unix epoch), if known.
+    pub last_used: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -178,13 +200,16 @@ impl Identities {
     /// Accept the connect-time standing delegation chain (the
     /// `DelegationChain.toJSON()` II form-POSTs back from the `/mcp` flow): parse
     /// it, verify it (II canister signature at the root, none expired), require
-    /// it to end at this session's backend key, and store it. Returns the
-    /// verified principal (`self_authenticating(user_key)` = `derive(anchor,
+    /// it to end at this session's backend key, and store it. `anchor_number` is
+    /// the user/anchor number II reports alongside the delegation (needed later
+    /// for `get_accounts`); pass `None` if the flow did not provide it. Returns
+    /// the verified principal (`self_authenticating(user_key)` = `derive(anchor,
     /// mcp_origin)`, the caller the II account-delegation methods authorize).
     pub async fn accept_standing(
         &self,
         session_id: &str,
         chain_json: &str,
+        anchor_number: Option<u64>,
     ) -> Result<String, String> {
         self.ensure_session(session_id).await;
         let (_, pubkey_der) = self.session_key(session_id).await.ok_or("session vanished")?;
@@ -203,6 +228,7 @@ impl Identities {
                 user_key: parsed.user_key,
                 chain: parsed.agent_chain,
                 expiration_ns: parsed.max_exp,
+                anchor_number,
             });
         }
         Ok(principal.to_text())
@@ -234,30 +260,143 @@ impl Identities {
             .map_err(|e| format!("invalid standing delegation chain: {e}"))
     }
 
-    /// Build the `ic-agent` identity for a domain, deriving the per-app account
-    /// delegation on demand (and caching it) if there is no fresh cached one.
+    /// The anchor (user) number behind this connection's standing credential,
+    /// captured from II's `/mcp` flow at connect time. Errors if there is no
+    /// standing credential, or if the flow did not report the anchor number.
+    async fn anchor_number(&self, session_id: &str) -> Result<u64, String> {
+        let sessions = self.sessions.read().await;
+        let s = sessions.get(session_id).ok_or("no such session")?;
+        let standing = s.standing.as_ref().ok_or(
+            "no standing Internet Identity credential for this connection — reconnect and sign \
+             in with Internet Identity",
+        )?;
+        standing.anchor_number.ok_or(
+            "this connection's Internet Identity credential did not include your anchor (user) \
+             number, which is required to list accounts — reconnect to sign in again"
+                .to_string(),
+        )
+    }
+
+    /// List the user's Internet Identity accounts at an app `domain`, via II's
+    /// `get_accounts(anchor_number, origin)` signed as the standing identity.
+    /// Every user has a default ("synthetic") account (`account_number == None`,
+    /// no name) at any origin, plus any named accounts they created there; each
+    /// is a distinct per-origin principal. Requires the standing credential and
+    /// the anchor number (see [`Self::anchor_number`]).
+    pub async fn list_accounts(
+        &self,
+        session_id: &str,
+        domain: &str,
+    ) -> Result<Vec<AccountInfo>, String> {
+        self.ensure_session(session_id).await;
+        let anchor = self.anchor_number(session_id).await?;
+        let standing = self.standing_identity(session_id).await?;
+        let agent = Agent::builder()
+            .with_url(IC_URL)
+            .with_identity(standing)
+            .build()
+            .map_err(|e| format!("could not build II agent: {e}"))?;
+        let canister = ii_canister_id()?;
+        let origin = target_origin(domain);
+
+        // get_accounts(anchor_number, origin) -> variant { Ok: vec AccountInfo; Err }
+        // A signed query: II authorizes the caller (the standing identity) and
+        // returns the anchor's accounts at `origin`.
+        let arg = Encode!(&anchor, &origin).map_err(|e| format!("could not encode get_accounts args: {e}"))?;
+        let reply = agent
+            .query(&canister, "get_accounts")
+            .with_arg(arg)
+            .call()
+            .await
+            .map_err(|e| format!("get_accounts failed: {e}"))?;
+        let accounts = Decode!(&reply, GetAccountsReply)
+            .map_err(|e| format!("could not decode get_accounts reply: {e}"))?
+            .map_err(|e| format!("II refused get_accounts: {e:?}"))?;
+
+        Ok(accounts
+            .into_iter()
+            .map(|a| AccountInfo {
+                account_number: a.account_number,
+                name: a.name,
+                last_used: a.last_used,
+            })
+            .collect())
+    }
+
+    /// Resolve an optional account `name` at `domain` to its account number
+    /// (`None` = the default account, used when `name` is `None`). Looks the name
+    /// up via [`Self::list_accounts`]; errors if no account (or more than one) at
+    /// the origin carries that name.
+    async fn resolve_account(
+        &self,
+        session_id: &str,
+        domain: &str,
+        name: Option<&str>,
+    ) -> Result<Option<u64>, String> {
+        let Some(name) = name else {
+            return Ok(None); // default ("synthetic") account
+        };
+        let accounts = self.list_accounts(session_id, domain).await?;
+        let mut matching = accounts.iter().filter(|a| a.name.as_deref() == Some(name));
+        match (matching.next(), matching.next()) {
+            (None, _) => Err(format!(
+                "no account named \"{name}\" at {domain} — call list_accounts(domain) to see your \
+                 accounts there, or omit `account` to use the default one"
+            )),
+            (Some(a), None) => Ok(a.account_number),
+            (Some(_), Some(_)) => Err(format!(
+                "more than one account named \"{name}\" at {domain}; cannot disambiguate"
+            )),
+        }
+    }
+
+    /// Build the `ic-agent` identity for the account named `account` at `domain`
+    /// (omit `account` for the default account). The account name is resolved to
+    /// its II account number, then the per-app delegation is derived/cached.
+    pub async fn delegated_identity_for(
+        &self,
+        session_id: &str,
+        domain: &str,
+        account: Option<&str>,
+    ) -> Result<DelegatedIdentity, String> {
+        let account_number = self.resolve_account(session_id, domain, account).await?;
+        self.delegated_identity(session_id, domain, account_number).await
+    }
+
+    /// Build the `ic-agent` identity for a domain + account number, deriving the
+    /// per-app account delegation on demand (and caching it) if there is no fresh
+    /// cached one. `account_number == None` is the origin's default account.
     pub async fn delegated_identity(
         &self,
         session_id: &str,
         domain: &str,
+        account_number: Option<u64>,
     ) -> Result<DelegatedIdentity, String> {
         self.ensure_session(session_id).await;
 
         // Reuse a cached, still-fresh delegation if present.
-        if let Some(app) = self.cached_fresh(session_id, domain).await {
+        if let Some(app) = self.cached_fresh(session_id, domain, account_number).await {
             return self.build_identity(session_id, &app).await;
         }
 
         // Otherwise derive a fresh one on demand against the II canister.
-        let app = self.derive_app_delegation(session_id, domain).await?;
+        let app = self.derive_app_delegation(session_id, domain, account_number).await?;
         let identity = self.build_identity(session_id, &app).await?;
-        self.store(session_id, domain, app).await;
+        self.store(session_id, domain, account_number, app).await;
         Ok(identity)
     }
 
-    async fn cached_fresh(&self, session_id: &str, domain: &str) -> Option<AppDelegation> {
+    async fn cached_fresh(
+        &self,
+        session_id: &str,
+        domain: &str,
+        account_number: Option<u64>,
+    ) -> Option<AppDelegation> {
         let sessions = self.sessions.read().await;
-        let app = sessions.get(session_id)?.app_delegations.get(domain)?;
+        let app = sessions
+            .get(session_id)?
+            .app_delegations
+            .get(&(domain.to_string(), account_number))?;
         if !app.fresh() {
             return None;
         }
@@ -268,10 +407,10 @@ impl Identities {
         })
     }
 
-    async fn store(&self, session_id: &str, domain: &str, app: AppDelegation) {
+    async fn store(&self, session_id: &str, domain: &str, account_number: Option<u64>, app: AppDelegation) {
         let mut sessions = self.sessions.write().await;
         if let Some(s) = sessions.get_mut(session_id) {
-            s.app_delegations.insert(domain.to_string(), app);
+            s.app_delegations.insert((domain.to_string(), account_number), app);
         }
     }
 
@@ -294,10 +433,12 @@ impl Identities {
     /// Derive a fresh per-app account delegation by calling II's
     /// `mcp_prepare_account_delegation` then `mcp_get_account_delegation`, AS the
     /// standing identity, with the backend session key as `session_key`.
+    /// `account_number == None` selects the origin's default account.
     async fn derive_app_delegation(
         &self,
         session_id: &str,
         domain: &str,
+        account_number: Option<u64>,
     ) -> Result<AppDelegation, String> {
         let (_, session_key_der) = self
             .session_key(session_id)
@@ -319,20 +460,20 @@ impl Identities {
         //   -> variant { Ok: McpPrepareDelegation; Err: AccountDelegationError }
         // `max_ttl` is in nanoseconds (we pass APP_DELEGATION_TTL_NS = 5 min).
         // `account_number = null` selects the anchor's default account at
-        // `target_origin`. That default is mutable, so II resolves it to a
-        // concrete account at prepare time and returns it in the reply; we thread
-        // that resolved account into `mcp_get_account_delegation` below so `get`
-        // reads the same account `prepare` signed for.
+        // `target_origin`; `Some(n)` selects a specific named account (its number
+        // resolved from `list_accounts`). The default is mutable, so II resolves
+        // the request to a concrete account at prepare time and returns it in the
+        // reply; we thread that resolved account into `mcp_get_account_delegation`
+        // below so `get` reads the same account `prepare` signed for.
         //
-        // Threading the *returned* account (rather than hardcoding one) is what
-        // keeps this working across II versions: the two methods' signatures are
-        // identical in dfinity/internet-identity#4052 and #4066, and `null`
+        // Threading the *returned* account (rather than re-sending our request) is
+        // what keeps this working across II versions: the two methods' signatures
+        // are identical in dfinity/internet-identity#4052 and #4066, and `null`
         // resolves to the anchor's default account in both (synthetic fallback in
         // #4052, `default_account_number()` in #4066 — both authorized, neither
         // errors). #4066 only drops the connect-time account picker and the
         // `account_number` arg on `mcp_set_access`/`mcp_access_enabled`, none of
-        // which this server calls. Keep passing `null` and threading the reply.
-        let account_number: Option<u64> = None;
+        // which this server calls.
         let prepare_arg = Encode!(
             &origin,
             &account_number,
@@ -494,6 +635,29 @@ enum AccountDelegationError {
 type PrepareReply = std::result::Result<PreparedDelegation, AccountDelegationError>;
 type GetReply = std::result::Result<IiSignedDelegation, AccountDelegationError>;
 
+// ---- II candid contract for get_accounts -----------------------------------
+
+/// One of an anchor's accounts at an origin (II `AccountInfo`). Decoded by name,
+/// so field order is irrelevant; the wire record's `origin` field is skipped (we
+/// already know the origin we queried).
+#[derive(CandidType, Deserialize)]
+struct IiAccountInfo {
+    account_number: Option<u64>,
+    last_used: Option<u64>,
+    name: Option<String>,
+}
+
+/// II's `GetAccountsError` — the `Err` arm of `get_accounts`.
+#[derive(CandidType, Deserialize, Debug)]
+enum GetAccountsError {
+    InternalCanisterError(String),
+    Unauthorized(Principal),
+}
+
+// `get_accounts` returns `variant { Ok: vec AccountInfo; Err: GetAccountsError }`.
+// Aliased so the `Decode!` macro doesn't choke on the comma inside the generic.
+type GetAccountsReply = std::result::Result<Vec<IiAccountInfo>, GetAccountsError>;
+
 /// One delegation as returned by II's `mcp_get_account_delegation`.
 #[derive(CandidType, Deserialize)]
 struct IiDelegation {
@@ -532,7 +696,7 @@ impl IiSignedDelegation {
 
 #[cfg(test)]
 mod tests {
-    use super::target_origin;
+    use super::*;
 
     #[test]
     fn remaps_gateway_domains_to_ic0_app() {
@@ -551,5 +715,112 @@ mod tests {
         assert_eq!(target_origin("oisy.com"), "https://oisy.com");
         assert_eq!(target_origin("https://oisy.com/app"), "https://oisy.com");
         assert_eq!(target_origin("http://oisy.com"), "https://oisy.com");
+    }
+
+    // Seed a session with a standing credential (optionally carrying an anchor
+    // number), bypassing the network connect flow.
+    async fn seed_standing(ids: &Identities, session_id: &str, anchor_number: Option<u64>) {
+        ids.ensure_session(session_id).await;
+        let mut sessions = ids.sessions.write().await;
+        let s = sessions.get_mut(session_id).expect("ensured session");
+        s.standing = Some(Standing {
+            user_key: vec![1, 2, 3],
+            chain: vec![],
+            expiration_ns: u64::MAX,
+            anchor_number,
+        });
+    }
+
+    // Insert a cached app delegation for (domain, account_number) directly.
+    async fn seed_app(ids: &Identities, session_id: &str, domain: &str, account: Option<u64>, exp: u64) {
+        let mut sessions = ids.sessions.write().await;
+        let s = sessions.get_mut(session_id).expect("session");
+        s.app_delegations.insert(
+            (domain.to_string(), account),
+            AppDelegation { user_key: vec![account.unwrap_or(0) as u8], chain: vec![], expiration_ns: exp },
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_number_requires_standing_and_a_number() {
+        let ids = Identities::new();
+        ids.ensure_session("sess").await;
+        // Authenticated session but no standing credential captured yet.
+        assert!(ids.anchor_number("sess").await.is_err());
+        // Unknown session is likewise an error.
+        assert!(ids.anchor_number("nope").await.is_err());
+        // Standing without an anchor number (older II) is a clear error.
+        seed_standing(&ids, "sess", None).await;
+        assert!(ids.anchor_number("sess").await.is_err());
+        // With an anchor number it is returned.
+        seed_standing(&ids, "sess2", Some(10_042)).await;
+        assert_eq!(ids.anchor_number("sess2").await.unwrap(), 10_042);
+    }
+
+    #[tokio::test]
+    async fn resolve_account_defaults_to_none_without_network() {
+        let ids = Identities::new();
+        seed_standing(&ids, "sess", Some(1)).await;
+        // No account name -> the default account, resolved with no network call.
+        assert_eq!(ids.resolve_account("sess", "oisy.com", None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cached_delegations_are_keyed_by_account_number() {
+        let ids = Identities::new();
+        seed_standing(&ids, "sess", Some(1)).await;
+        let future = now_ns() + REDERIVE_MARGIN_NS + 60 * 1_000_000_000;
+        seed_app(&ids, "sess", "oisy.com", None, future).await;
+        seed_app(&ids, "sess", "oisy.com", Some(7), future).await;
+
+        // Each (domain, account) is cached independently.
+        assert!(ids.cached_fresh("sess", "oisy.com", None).await.is_some());
+        assert!(ids.cached_fresh("sess", "oisy.com", Some(7)).await.is_some());
+        // An account we never derived is a cache miss.
+        assert!(ids.cached_fresh("sess", "oisy.com", Some(9)).await.is_none());
+        // A different domain is a cache miss.
+        assert!(ids.cached_fresh("sess", "nns.ic0.app", None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_delegation_near_expiry_is_a_miss() {
+        let ids = Identities::new();
+        seed_standing(&ids, "sess", Some(1)).await;
+        // Expiry within the re-derive margin -> treated as stale.
+        seed_app(&ids, "sess", "oisy.com", None, now_ns() + 1).await;
+        assert!(ids.cached_fresh("sess", "oisy.com", None).await.is_none());
+    }
+
+    // Lock in the get_accounts Candid contract: a `vec AccountInfo` (with the full
+    // four-field record, incl. `origin`) decodes into our subset `IiAccountInfo`
+    // (origin skipped), and the Ok/Err variant maps to a Rust Result.
+    #[test]
+    fn get_accounts_reply_decodes_account_records() {
+        #[derive(CandidType)]
+        struct WireAccount {
+            account_number: Option<u64>,
+            origin: String,
+            last_used: Option<u64>,
+            name: Option<String>,
+        }
+        let wire: std::result::Result<Vec<WireAccount>, GetAccountsError> = Ok(vec![
+            WireAccount { account_number: None, origin: "https://oisy.com".into(), last_used: None, name: None },
+            WireAccount {
+                account_number: Some(7),
+                origin: "https://oisy.com".into(),
+                last_used: Some(123),
+                name: Some("savings".into()),
+            },
+        ]);
+        let bytes = Encode!(&wire).expect("encode");
+        let decoded = Decode!(&bytes, GetAccountsReply).expect("decode").expect("Ok arm");
+        assert_eq!(decoded.len(), 2);
+        // Default (synthetic) account: no number, no name.
+        assert_eq!(decoded[0].account_number, None);
+        assert_eq!(decoded[0].name, None);
+        // Named account: number, name, and last_used recovered (origin ignored).
+        assert_eq!(decoded[1].account_number, Some(7));
+        assert_eq!(decoded[1].name.as_deref(), Some("savings"));
+        assert_eq!(decoded[1].last_used, Some(123));
     }
 }
