@@ -228,7 +228,7 @@ test("checkMcpEndpoints flags a missing OAuth challenge", async () => {
   }
 });
 
-test("checkIiHealth detects MCP recognition via form-action", async () => {
+test("checkIiHealth verifies the /mcp delegation flow and config", async () => {
   const ii = "https://beta.test";
   const mcp = "https://mcp.beta.test";
   const restore = stubFetch({
@@ -236,31 +236,40 @@ test("checkIiHealth detects MCP recognition via form-action", async () => {
       headers: {
         "x-ic-canister-id": "gjxif-ryaaa-aaaad-ae4ka-cai",
         "ic-certificate": "certificate=:abc:",
-        "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:* ${mcp};frame-ancestors 'self' ${ii} https://beta.identity.ic0.app`,
+        // SPA-wide form-action is tight and never lists the MCP origin (#4052).
+        "content-security-policy": `default-src 'none';form-action 'self' http://127.0.0.1:*;frame-ancestors 'self' ${ii} https://beta.identity.ic0.app`,
+      },
+    }),
+    // The /mcp connect page relaxes form-action to allow https: callback posts.
+    [`GET ${ii}/mcp`]: resp(200, {
+      headers: {
+        "content-security-policy": `default-src 'none';form-action 'self' https:`,
       },
     }),
     [`GET ${ii}/.config`]: resp(200, {
-      headers: { "content-type": "text/plain" },
-      body: `record {\n  backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai";\n  related_origins = opt vec { "${ii}"; };\n  mcp_server_origin = opt "${mcp}";\n}`,
+      headers: { "content-type": "text/plain", "content-length": "110" },
+      body: `record {\n  backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai";\n  related_origins = opt vec { "${ii}"; };\n}`,
     }),
   });
   try {
     const { section, facts } = await checkIiHealth(ii, mcp, 2000);
     assert.equal(byId(section, "ii-reachable").status, "pass");
     assert.equal(byId(section, "ii-certified").status, "pass");
-    assert.equal(byId(section, "ii-recognises-mcp").status, "pass");
+    assert.equal(byId(section, "ii-mcp-flow").status, "pass");
     assert.equal(byId(section, "ii-config").status, "pass");
-    assert.equal(byId(section, "ii-config-mcp-origin").status, "pass");
+    // The obsolete mcp_server_origin checks are gone.
+    assert.equal(byId(section, "ii-recognises-mcp"), undefined);
+    assert.equal(byId(section, "ii-config-mcp-origin"), undefined);
     assert.equal(facts.canisterId, "gjxif-ryaaa-aaaad-ae4ka-cai");
     assert.deepEqual(facts.relatedOrigins, [ii, "https://beta.identity.ic0.app"]);
     assert.equal(facts.config.status, 200);
-    assert.equal(facts.config.mcpServerOrigin, mcp);
+    assert.equal(facts.config.backendCanisterId, "fgte5-ciaaa-aaaad-aaatq-cai");
   } finally {
     restore();
   }
 });
 
-test("checkIiHealth fails recognition when MCP origin is absent", async () => {
+test("checkIiHealth fails when the /mcp flow is not served", async () => {
   const ii = "https://beta.test";
   const mcp = "https://mcp.beta.test";
   const restore = stubFetch({
@@ -269,31 +278,58 @@ test("checkIiHealth fails recognition when MCP origin is absent", async () => {
         "content-security-policy": `form-action 'self' http://127.0.0.1:*`,
       },
     }),
+    [`GET ${ii}/mcp`]: resp(404),
     [`GET ${ii}/.config`]: resp(404),
   });
   try {
     const { section } = await checkIiHealth(ii, mcp, 2000);
-    assert.equal(byId(section, "ii-recognises-mcp").status, "fail");
+    assert.equal(byId(section, "ii-mcp-flow").status, "fail");
     assert.equal(byId(section, "ii-config").status, "fail");
-    // No config served → mcp_server_origin can't be read → informational warn.
-    assert.equal(byId(section, "ii-config-mcp-origin").status, "warn");
   } finally {
     restore();
   }
 });
 
-test("buildSuggestions surfaces a recognition failure", () => {
+test("checkIiHealth warns when the /mcp form-action forbids https posts", async () => {
+  const ii = "https://beta.test";
+  const mcp = "https://mcp.beta.test";
+  const restore = stubFetch({
+    [`GET ${ii}/`]: resp(200, {
+      headers: { "content-security-policy": `form-action 'self'` },
+    }),
+    // Page served, but form-action only allows loopback — an https callback POST
+    // would be blocked, so the flow is reachable but misconfigured for remotes.
+    [`GET ${ii}/mcp`]: resp(200, {
+      headers: {
+        "content-security-policy": `form-action 'self' http://127.0.0.1:*`,
+      },
+    }),
+    [`GET ${ii}/.config`]: resp(200, {
+      headers: { "content-type": "text/plain" },
+      body: `record { backend_canister_id = principal "fgte5-ciaaa-aaaad-aaatq-cai"; }`,
+    }),
+  });
+  try {
+    const { section } = await checkIiHealth(ii, mcp, 2000);
+    assert.equal(byId(section, "ii-mcp-flow").status, "warn");
+    assert.equal(byId(section, "ii-config").status, "pass");
+  } finally {
+    restore();
+  }
+});
+
+test("buildSuggestions surfaces a /mcp delegation flow failure", () => {
   const sections = [
     {
       id: "ii-health",
       title: "",
       status: "fail",
-      checks: [{ id: "ii-recognises-mcp", status: "fail" }],
+      checks: [{ id: "ii-mcp-flow", status: "fail" }],
     },
   ];
   const suggestions = buildSuggestions(sections, {});
   assert.ok(
-    suggestions.some((s) => s.includes("mcp_server_origin")),
-    "expected a suggestion about mcp_server_origin",
+    suggestions.some((s) => s.includes("/mcp")),
+    "expected a suggestion about the /mcp delegation flow",
   );
 });

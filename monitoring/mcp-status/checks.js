@@ -748,36 +748,58 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       : "no ic-certificate header (response not certified by the IC?)",
   });
 
-  // 3. Recognition: the II's mcp_server_origin config is reflected verbatim
-  //    into the response CSP `form-action` directive. If our MCP origin is
-  //    listed, the II trusts it and the /mcp delegation flow will accept its
-  //    callbacks; if not, the flow is disabled for this MCP server.
-  const formAction = parseCspDirective(csp, "form-action");
-  facts.formAction = formAction;
-  const recognised = !!formAction && formAction.includes(mcpOrigin);
-  checks.push({
-    id: "ii-recognises-mcp",
-    label: "II recognises this MCP server",
-    description:
-      "Verifies the II's response CSP form-action directive lists this MCP origin — the authoritative signal that the II trusts this server and the /mcp delegation flow is enabled for it.",
-    target: `${iiOrigin} CSP form-action`,
-    expected: `form-action contains ${mcpOrigin}`,
-    status: recognised ? "pass" : "fail",
-    httpStatus: null,
-    latencyMs: null,
-    detail: formAction
-      ? recognised
-        ? `form-action lists ${mcpOrigin} → /mcp delegation enabled`
-        : `form-action = [${formAction.join(", ")}] (does NOT include ${mcpOrigin})`
-      : "no form-action directive found in CSP",
-  });
+  // 3. /mcp delegation flow. Since dfinity/internet-identity#4052 the II no
+  //    longer has a global `mcp_server_origin`, and trust is per-user: each
+  //    identity adds the MCP server it trusts in II Settings, synced on-chain.
+  //    So there is no global, unauthenticated signal that names this specific
+  //    server — recognition is per-identity and not inspectable from here.
+  //    What IS instance-wide and inspectable is whether the `/mcp` connect page
+  //    is served and whether its CSP `form-action` is relaxed to allow posting
+  //    the delegation callback to an https MCP server (`'self' https:` on /mcp
+  //    paths, vs the tighter `'self' http://127.0.0.1:*` SPA-wide). That relaxed
+  //    form-action is what lets any https MCP server's connect callback POST
+  //    back, so it is the authoritative health signal for the delegation flow.
+  {
+    const url = `${iiOrigin}/mcp`;
+    const mr = await probe(url, { timeoutMs });
+    const mcpFormAction = parseCspDirective(
+      mr.headers.get("content-security-policy"),
+      "form-action",
+    );
+    facts.mcpFormAction = mcpFormAction;
+    // The callback is posted to an https origin, so the /mcp page's form-action
+    // must permit https: (the `https:` scheme source, or this exact origin).
+    const allowsHttpsPost =
+      !!mcpFormAction &&
+      (mcpFormAction.includes("https:") || mcpFormAction.includes(mcpOrigin));
+    const served = mr.ok && mr.status === 200;
+    checks.push({
+      id: "ii-mcp-flow",
+      label: "II /mcp delegation flow enabled",
+      description:
+        "Confirms the II serves its /mcp delegation page and that its CSP form-action is relaxed to allow posting the delegation callback to an https MCP server. Since #4052 trust is per-user (each identity adds its trusted server in II Settings, synced on-chain), so which servers a given identity trusts is not globally inspectable; this checks the instance-wide flow is enabled.",
+      target: `GET ${url} CSP form-action`,
+      expected: "200 and form-action allows https: (callback can post to https)",
+      status: served ? (allowsHttpsPost ? "pass" : "warn") : "fail",
+      httpStatus: mr.status,
+      latencyMs: mr.latencyMs,
+      detail: mr.error
+        ? `request failed: ${mr.error.message}`
+        : !served
+          ? `${mr.status}, /mcp delegation page not served`
+          : mcpFormAction
+            ? allowsHttpsPost
+              ? `form-action = [${mcpFormAction.join(", ")}] → can post the callback to https MCP servers`
+              : `form-action = [${mcpFormAction.join(", ")}] (does NOT allow https: — the callback to ${mcpOrigin} would be blocked)`
+            : "200 but no form-action directive in the /mcp CSP",
+    });
+  }
 
-  // 3b. II frontend config: the II serves its runtime config as a textual
-  //     Candid record at /.config. It is the source of truth the form-action
-  //     CSP above is derived from — in particular its `mcp_server_origin` field
-  //     names the MCP server this II trusts. Confirm it is served and read that
-  //     field back out.
-  let configMcpOrigin;
+  // 3b. II frontend config: the II still serves its runtime config as a textual
+  //     Candid record at /.config (backend canister id, related origins, …). It
+  //     no longer carries `mcp_server_origin` (removed in #4052 — MCP trust moved
+  //     to per-user, on-chain settings), so we only confirm it is served and
+  //     surface the backend canister id.
   {
     const url = `${iiOrigin}/.config`;
     const cr = await probe(url, { timeoutMs });
@@ -794,20 +816,19 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
     const looksLikeConfig =
       /\brecord\s*\{/.test(cr.bodyText) ||
       cr.bodyText.includes("backend_canister_id");
-    // Extract `mcp_server_origin = opt "<origin>"` from the textual Candid.
-    const m = cr.bodyText.match(/mcp_server_origin\s*=\s*opt\s*"([^"]+)"/);
-    configMcpOrigin = m ? m[1] : undefined;
+    // Surface the backend canister id (the II canister the delegation methods
+    // target) from the textual Candid, for context.
+    const m = cr.bodyText.match(
+      /backend_canister_id\s*=\s*principal\s*"([^"]+)"/,
+    );
+    const backendCanisterId = m ? m[1] : undefined;
     const present = cr.ok && cr.status === 200 && looksLikeConfig;
-    facts.config = {
-      status: cr.status,
-      bytes,
-      mcpServerOrigin: configMcpOrigin,
-    };
+    facts.config = { status: cr.status, bytes, backendCanisterId };
     checks.push({
       id: "ii-config",
       label: "II frontend config (.config)",
       description:
-        "Checks the II frontend serves its runtime config (textual Candid) at /.config — the source of truth the form-action CSP is derived from, including the mcp_server_origin it trusts.",
+        "Checks the II frontend serves its runtime config (textual Candid) at /.config, reporting the backend canister id. (Post-#4052 this config no longer carries an mcp_server_origin — MCP trust moved to per-user, on-chain settings.)",
       target: `GET ${url}`,
       expected: "200 textual Candid config record",
       status: present ? "pass" : cr.status === 200 ? "warn" : "fail",
@@ -816,30 +837,8 @@ export const checkIiHealth = async (iiOrigin, mcpOrigin, timeoutMs) => {
       detail: cr.error
         ? `request failed: ${cr.error.message}`
         : present
-          ? `${cr.status}, ${bytes} bytes, mcp_server_origin=${configMcpOrigin ?? "(absent)"}`
+          ? `${cr.status}, ${bytes} bytes${backendCanisterId ? `, backend ${backendCanisterId}` : ""}`
           : `${cr.status}, ${cr.bodyText.slice(0, 80) || "(empty)"}`,
-    });
-  }
-
-  // 3c. The config's mcp_server_origin must name this exact MCP server. This is
-  //     the authoritative config-level counterpart to the form-action CSP check.
-  {
-    const matches = configMcpOrigin === mcpOrigin;
-    checks.push({
-      id: "ii-config-mcp-origin",
-      label: "Config mcp_server_origin matches",
-      description:
-        "Verifies the II config's mcp_server_origin names exactly this MCP server — the authoritative config field the II's recognition (and its form-action CSP) is derived from.",
-      target: `${iiOrigin}/.config → mcp_server_origin`,
-      expected: `mcp_server_origin = opt "${mcpOrigin}"`,
-      status: matches ? "pass" : configMcpOrigin ? "fail" : "warn",
-      httpStatus: null,
-      latencyMs: null,
-      detail: configMcpOrigin
-        ? matches
-          ? `mcp_server_origin = ${configMcpOrigin}`
-          : `mcp_server_origin = ${configMcpOrigin} (expected ${mcpOrigin})`
-        : "no mcp_server_origin found in /.config",
     });
   }
 
@@ -926,11 +925,20 @@ export const buildSuggestions = (sections, facts) => {
   const checkById = {};
   for (const s of sections) for (const c of s.checks) checkById[c.id] = c;
 
-  if (checkById["ii-recognises-mcp"]?.status === "fail") {
+  if (checkById["ii-mcp-flow"]?.status === "fail") {
     suggestions.push(
-      "The linked II does not list this MCP origin in its CSP form-action. " +
-        "The /mcp delegation flow will reject callbacks until the II canister " +
-        "is (re)deployed with mcp_server_origin set to this exact origin.",
+      "The linked II does not serve its /mcp delegation page. The MCP connect " +
+        "flow cannot run until an II build that includes the /mcp flow is " +
+        "deployed at this origin.",
+    );
+  } else if (checkById["ii-mcp-flow"]?.status === "warn") {
+    suggestions.push(
+      "The II /mcp page is served but its CSP form-action does not allow " +
+        "https:, so it cannot post the delegation callback to an https MCP " +
+        "server. Note that since #4052 each user also adds the trusted MCP " +
+        "server in II Settings (synced on-chain): a connect only succeeds for " +
+        "servers the signed-in identity has trusted, which this dashboard " +
+        "cannot verify without authenticating.",
     );
   }
   if (checkById["mcp-challenge"]?.status !== "pass") {

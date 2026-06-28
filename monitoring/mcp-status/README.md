@@ -15,16 +15,19 @@ It answers three questions and adds a few suggestions:
    origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention,
    overridable, and confirmed live via the `/oauth/authorize` redirect when the
    server exposes one).
-3. **Is that II instance healthy and does it recognise this MCP server?** —
+3. **Is that II instance healthy and is its `/mcp` delegation flow enabled?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
-   (textual Candid) at `/.config` and that the config's `mcp_server_origin`
-   field names this MCP server, and verifies that the II's response CSP
-   `form-action` directive lists this MCP origin. The config's
-   `mcp_server_origin` is the source of truth — the `form-action` CSP is derived
-   from it server-side — so together they are the authoritative signal that the
-   II trusts this MCP server and that the `/mcp` delegation flow is enabled for
-   it.
+   (textual Candid) at `/.config`, and verifies the `/mcp` delegation page is
+   served with a CSP `form-action` relaxed to allow posting the delegation
+   callback to an https MCP server (`'self' https:` on `/mcp` paths, vs the
+   tighter `'self' http://127.0.0.1:*` SPA-wide). Since
+   [internet-identity#4052](https://github.com/dfinity/internet-identity/pull/4052)
+   there is no global `mcp_server_origin` and **trust is per-user**: each
+   identity adds the MCP server it trusts in II Settings, synced on-chain. So
+   whether a *specific* identity trusts this server is not inspectable from here
+   without authenticating — what is instance-wide and checkable is that the
+   delegation flow itself is deployed and its callback POST is permitted.
 
 Every check carries a plain-language description, and the report shows which
 **deployment is running** — the MCP server's version and git commit (read from
@@ -113,8 +116,11 @@ actually matters.
 ## Current beta findings (snapshot)
 
 Against `https://mcp.beta.id.ai` the server passes all endpoint checks; the
-linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`),
-which **does** recognise the MCP server via its `form-action` CSP. Live link
-discovery via `/oauth/authorize` is reported as a warning because the redirect
-to II only happens after interactive client setup and isn't readable headlessly
-— informational, not an outage.
+linked II is `https://beta.id.ai` (frontend canister `gjxif-ryaaa-aaaad-ae4ka-cai`,
+backend `fgte5-ciaaa-aaaad-aaatq-cai`), whose `/mcp` delegation flow is enabled
+(its `/mcp` CSP `form-action` is relaxed to `'self' https:`, so the connect
+callback can post back). Whether a given identity trusts this MCP server is now
+per-user (set in II Settings, synced on-chain) and so is not asserted here. Live
+link discovery via `/oauth/authorize` is reported as a warning because the
+redirect to II only happens after interactive client setup and isn't readable
+headlessly — informational, not an outage.
