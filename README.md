@@ -110,7 +110,8 @@ curl -fsSL https://github.com/aterga/imcp2/releases/latest/download/imcp-$(uname
 ```
 
 Assets are named `imcp-<uname -s>-<uname -m>.tar.gz` (e.g.
-`imcp-Darwin-arm64.tar.gz`, `imcp-Linux-x86_64.tar.gz`). Linux binaries target
+`imcp-Darwin-arm64.tar.gz`, `imcp-Linux-x86_64.tar.gz`,
+`imcp-Linux-aarch64.tar.gz`). Linux binaries target
 glibc 2.35+ (Ubuntu 22.04+, Debian
 12+); on older distros use the `Dockerfile` instead. Releases are produced by
 [`.github/workflows/release.yml`](.github/workflows/release.yml) on each `v*` tag.
@@ -141,7 +142,9 @@ options.
 
 ## Deploy
 
-The server is a single binary plus the `static/` assets. Two requirements when hosting:
+The server is a single self-contained binary — the `static/` assets are baked in
+at build time via `include_str!`, so nothing else ships at runtime. Two
+requirements when hosting:
 
 - **HTTPS** — the id.ai passkey (WebAuthn) only works in a secure context.
 - **`PUBLIC_URL`** — set it to the public https URL; it's used in the OAuth
