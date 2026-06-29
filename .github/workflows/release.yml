@@ -1,0 +1,123 @@
+# Build prebuilt binaries and publish them to a GitHub Release.
+#
+# Push a version tag (`git tag v0.1.0 && git push --tags`) to build a
+# self-contained binary for each platform and attach it to a DRAFT release for
+# review. Or run manually (Actions -> Release binaries -> Run workflow) to build
+# the binaries as downloadable run artifacts without cutting a release.
+#
+# The binary is fully self-contained: the only static assets (the Candid cheat
+# sheets and HTML pages) are baked in at compile time via include_str!, so each
+# release asset is a single executable — download, extract, run.
+#
+# We build NATIVELY on a runner per target (no cross-compiling): the rustls
+# crypto backend (aws-lc-sys) needs cmake + a C toolchain and is painful to
+# cross-build or link against musl, so native builds are the reliable path. The
+# Linux gnu binaries are built on Ubuntu 22.04 (glibc 2.35); for older distros,
+# use the Dockerfile instead.
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# contents: write is needed to create the release and upload assets.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Asset names follow `uname -s`/`uname -m` so the README's
+          #   curl .../imcp-$(uname -s)-$(uname -m).tar.gz
+          # one-liner resolves to the right file on each platform.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: imcp-Linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: imcp-Linux-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: imcp-Darwin-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: imcp-Darwin-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # aws-lc-sys (rustls' crypto backend) builds C with cmake/clang at compile
+      # time. macOS runners ship these; Linux runners need libclang explicitly.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl pkg-config
+
+      - name: Build release binary
+        shell: bash
+        env:
+          # Baked into the binary (option_env! in main.rs), surfaced at GET /version.
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          export BUILD_TIME="$(date +%s)"
+          # Build for the explicit target triple (each runner's native target) so
+          # the per-platform intent is clear and the output path is deterministic.
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mcp-poc" dist/imcp
+          chmod +x dist/imcp
+          tar -C dist -czf "${{ matrix.asset }}.tar.gz" imcp
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.tar.gz
+            ${{ matrix.asset }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Idempotent: create the draft release on first run, or just (re)upload
+          # the assets if the release already exists (re-run of the same tag).
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/*.sha256 \
+          || gh release upload "$TAG" \
+            artifacts/*.tar.gz artifacts/*.sha256 --clobber
