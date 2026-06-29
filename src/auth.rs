@@ -252,13 +252,6 @@ pub struct ConnectCallback {
     delegation: String,
     /// The single-use connect state set at `/oauth/authorize`.
     state: String,
-    /// The user/anchor number II reports for the signed-in identity, captured so
-    /// the account tools can call `get_accounts(anchor, origin)`. The `/mcp` flow
-    /// posts it as a string field; accepted under a few spellings for forward
-    /// compatibility. Optional — absent on older II builds, in which case account
-    /// listing is unavailable until the user reconnects.
-    #[serde(default, alias = "anchor_number", alias = "userNumber", alias = "anchorNumber")]
-    user_number: Option<String>,
 }
 
 /// POST /oauth/connect/callback — verify and store the standing credential, then
@@ -273,13 +266,9 @@ pub async fn connect_callback(
         None => return connect_error("unknown or already-used connect request"),
     };
 
-    // The anchor number arrives as a string form field; parse it leniently (a
-    // malformed/absent value just means account listing needs a reconnect).
-    let anchor_number = form.user_number.as_deref().and_then(|s| s.trim().parse::<u64>().ok());
-
     let principal = match store
         .identities
-        .accept_standing(&pending.session_id, &form.delegation, anchor_number)
+        .accept_standing(&pending.session_id, &form.delegation)
         .await
     {
         Ok(p) => p,
