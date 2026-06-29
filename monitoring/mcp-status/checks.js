@@ -531,8 +531,10 @@ export const checkMcpEndpoints = async (mcpOrigin, timeoutMs) => {
  * carries its params in the fragment and form-action CSP is enforced across
  * redirects — so there is no `Location` header to read and the probe could
  * never pass. Instead we resolve the origin (configured or naming-convention
- * derived) and let the II-health section below confirm the pairing for real by
- * probing that origin's `/mcp` delegation flow.
+ * derived); the II-health section below then checks that *resolved* origin is
+ * reachable and has its `/mcp` delegation flow enabled. Note this does not
+ * live-verify that the MCP server actually hands off to that II instance — the
+ * pairing is inferred from config / the naming convention, not proven.
  *
  * @param {string} mcpOrigin
  * @param {string | undefined} configuredIi
@@ -557,7 +559,7 @@ export const checkLinkage = (mcpOrigin, configuredIi, iiOriginSource) => {
     id: "ii-target",
     label: "Linked Internet Identity instance",
     description:
-      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention). The pairing is confirmed for real by the II-health section below, which probes this origin's /mcp delegation flow.",
+      "Identifies which Internet Identity instance this MCP server is paired with (explicitly configured, or derived from the naming convention — the pairing is inferred, not live-verified). The II-health section below then checks that resolved origin is reachable and has its /mcp delegation flow enabled.",
     target: mcpOrigin,
     expected: "a resolvable II origin",
     status: iiOrigin ? "pass" : "fail",

@@ -13,8 +13,10 @@ It answers three questions and adds a few suggestions:
    `/oauth/authorize` + `/oauth/token` endpoints, plus TLS certificate freshness.
 2. **Which Internet Identity instance is it linked to?** — resolves the II
    origin (derived from the `mcp.<env>.id.ai` ↔ `<env>.id.ai` convention, or
-   overridden explicitly). The pairing is then confirmed for real by question 3,
-   which probes that origin's `/mcp` delegation flow.
+   overridden explicitly). Question 3 then checks that resolved origin is
+   reachable and has its `/mcp` delegation flow enabled. The pairing itself is
+   inferred from config / the naming convention — the dashboard doesn't
+   live-verify that the MCP server actually hands off to that II instance.
 3. **Is that II instance healthy and is its `/mcp` delegation flow enabled?** —
    checks the II frontend is reachable and IC-certified, reports its frontend
    canister id and related origins, confirms it serves its runtime config
